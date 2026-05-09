@@ -20,7 +20,7 @@ case "$ROLE" in
     ROLE_FILE="$FOREMAN_DIR/references/roles/orchestrator.md"
     ;;
   dissenter)
-    MODEL="opus"
+    MODEL="gemini-3.1-pro"
     SESSION_NAME="foreman-dissenter"
     ROLE_FILE="$FOREMAN_DIR/references/roles/dissenter.md"
     ;;
@@ -110,6 +110,17 @@ SCRIPT
 #!/usr/bin/env zsh
 cd $q_cwd
 echo "[muse] Starting Gemma4 bridge..."
+exec python3 $q_bridge --model $q_model
+SCRIPT
+    elif [ "$ROLE" = "dissenter" ]; then
+      # Dissenter runs as a Python bridge talking directly to the relay hub + Google Gemini API.
+      # Requires: pip install google-generativeai and GOOGLE_API_KEY or GEMINI_API_KEY set.
+      local q_bridge
+      q_bridge="$(printf '%q' "$FOREMAN_DIR/scripts/foreman-dissenter-bridge.py")"
+      cat > "$tmpscript" <<SCRIPT
+#!/usr/bin/env zsh
+cd $q_cwd
+echo "[dissenter] Starting Gemini bridge..."
 exec python3 $q_bridge --model $q_model
 SCRIPT
     else

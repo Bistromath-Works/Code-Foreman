@@ -18,7 +18,7 @@ Five distinct roles, each running as a separate Claude Code session connected vi
 | Role | Model | Count | Purpose |
 |------|-------|-------|---------|
 | Orchestrator | Opus | 1 | Plans, delegates, tracks, approves. The foreman. |
-| Dissenter | Opus | 1 | Challenges plans before execution and results before commit. |
+| Dissenter | Gemini 3.1 | 1 | Challenges plans before execution and results before commit. |
 | Worker | Sonnet | 1+ | Builds. Scaled by the Orchestrator based on job scope. |
 | Cleaner | Haiku | 1 | Continuous tidying plus final sweep at job completion. |
 | Circuit Breaker | Haiku | 1 | Monitors all relay traffic for loops and forces resolution. |
