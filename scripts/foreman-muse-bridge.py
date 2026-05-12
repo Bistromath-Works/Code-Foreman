@@ -24,6 +24,7 @@ from pathlib import Path
 PROTOCOL_VERSION = "2"
 DEFAULT_MODEL = "gemma4"
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+MAX_LINE_BYTES = 4 * 1024 * 1024   # 4 MB — guard against unbounded relay messages
 
 # Hub socket candidate paths (tried in order)
 SOCKET_CANDIDATES = [
@@ -69,8 +70,15 @@ def read_line(sock: socket.socket) -> dict:
         if not chunk:
             raise ConnectionError("Hub disconnected unexpectedly.")
         if chunk == b"\n":
-            return json.loads(buf.decode("utf-8"))
+            try:
+                return json.loads(buf.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                raise ConnectionError(f"Invalid JSON from hub: {e}") from e
         buf += chunk
+        if len(buf) > MAX_LINE_BYTES:
+            raise ConnectionError(
+                f"Relay message exceeded {MAX_LINE_BYTES} bytes — aborting."
+            )
 
 
 def send(sock: socket.socket, obj: dict) -> None:
