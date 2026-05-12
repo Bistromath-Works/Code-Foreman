@@ -13,22 +13,44 @@ WORKER_NUM="${2:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FOREMAN_DIR="$(dirname "$SCRIPT_DIR")"
 
+USE_BRIDGE=false
+USE_WORKTREE=false
+BRIDGE_SCRIPT=""
+WORKTREE_PATH=""
+WORKTREE_BRANCH=""
+
 case "$ROLE" in
   orchestrator)
-    MODEL="opus"
+    MODEL="claude-opus-4-6"
     SESSION_NAME="foreman-orchestrator"
     ROLE_FILE="$FOREMAN_DIR/references/roles/orchestrator.md"
     ;;
+  architect)
+    MODEL="qwen3.5:latest"
+    SESSION_NAME="foreman-architect"
+    ROLE_FILE="$FOREMAN_DIR/references/roles/architect.md"
+    USE_BRIDGE=true
+    BRIDGE_SCRIPT="$FOREMAN_DIR/scripts/foreman-architect-bridge.py"
+    ;;
   dissenter)
-    MODEL="opus"
+    MODEL="gemini-3.1-pro"
     SESSION_NAME="foreman-dissenter"
     ROLE_FILE="$FOREMAN_DIR/references/roles/dissenter.md"
+    USE_BRIDGE=true
+    BRIDGE_SCRIPT="$FOREMAN_DIR/scripts/foreman-dissenter-bridge.py"
+    ;;
+  inspector)
+    MODEL="claude-opus-4-7"
+    SESSION_NAME="foreman-inspector"
+    ROLE_FILE="$FOREMAN_DIR/references/roles/inspector.md"
     ;;
   worker)
     MODEL="sonnet"
     [ -z "$WORKER_NUM" ] && { echo "Error: worker requires a number"; exit 1; }
+    [[ "$WORKER_NUM" =~ ^[0-9]+$ ]] || { echo "Error: worker number must be numeric, got: '$WORKER_NUM'"; exit 1; }
     SESSION_NAME="foreman-worker-$WORKER_NUM"
     ROLE_FILE="$FOREMAN_DIR/references/roles/worker.md"
+    USE_WORKTREE=true
     ;;
   cleaner)
     MODEL="haiku"
@@ -41,24 +63,41 @@ case "$ROLE" in
     ROLE_FILE="$FOREMAN_DIR/references/roles/circuit-breaker.md"
     ;;
   muse)
-    MODEL="gemma4"
+    MODEL="gemma4:latest"
     SESSION_NAME="foreman-muse"
     ROLE_FILE="$FOREMAN_DIR/references/roles/muse.md"
-    USE_OLLAMA=true
+    USE_BRIDGE=true
+    BRIDGE_SCRIPT="$FOREMAN_DIR/scripts/foreman-muse-bridge.py"
     ;;
   *)
     echo "Error: Unknown role '$ROLE'"
-    echo "Valid roles: orchestrator, dissenter, worker, cleaner, circuit-breaker, muse"
+    echo "Valid roles: orchestrator, architect, dissenter, inspector, worker, cleaner, circuit-breaker, muse"
     exit 1
     ;;
 esac
 
 PROTOCOL_FILE="$FOREMAN_DIR/references/protocol.md"
-USE_OLLAMA="${USE_OLLAMA:-false}"
 
 for f in "$ROLE_FILE" "$PROTOCOL_FILE"; do
   [ -f "$f" ] || { echo "Error: Missing file: $f"; exit 1; }
 done
+
+if [ "$USE_BRIDGE" = "true" ] && [ -n "$BRIDGE_SCRIPT" ]; then
+  [ -f "$BRIDGE_SCRIPT" ] || { echo "Error: Missing bridge script: $BRIDGE_SCRIPT"; exit 1; }
+fi
+
+# Create an isolated git worktree for this Worker if the project is a git repo.
+if [ "$USE_WORKTREE" = "true" ]; then
+  if git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+    WORKTREE_BRANCH="foreman-worker-$WORKER_NUM-$(date +%s)-$$"
+    WORKTREE_PATH="/tmp/foreman-worker-$WORKER_NUM-$$"
+    git worktree add -b "$WORKTREE_BRANCH" "$WORKTREE_PATH" HEAD
+    echo "Worker worktree created: $WORKTREE_PATH (branch: $WORKTREE_BRANCH)"
+  else
+    echo "Warning: Not a git repo — Worker $WORKER_NUM will share the main directory."
+    WORKTREE_PATH="$(pwd)"
+  fi
+fi
 
 spawn_session() {
   local tmpdir tmpscript script_cwd
@@ -83,41 +122,52 @@ SCRIPT
 
   else
     # Autonomous crew member — runs non-interactively.
-    # Build the full init message (protocol + role + startup instructions).
-    {
-      cat "$PROTOCOL_FILE"
-      echo ""
-      echo "---"
-      echo ""
-      cat "$ROLE_FILE"
-      echo ""
-      echo "---"
-      echo ""
-      echo "STARTUP SEQUENCE — execute immediately, in order:"
-      echo "1. relay_rename new_name=\"$SESSION_NAME\""
-      echo "2. relay_ask to=\"foreman-orchestrator\" question=\"$SESSION_NAME is online and ready\""
-      echo "3. relay_listen(timeout_ms=300000) — block until a message arrives"
-      echo "4. Handle the message per your role, then relay_reply with your result"
-      echo "5. Return to step 3. Continue this loop until you receive a shutdown signal."
-    } > "$tmpdir/init_msg.txt"
-
-    if [ "$ROLE" = "muse" ]; then
-      # Muse runs as a Python bridge talking directly to the relay hub + Ollama API.
-      # No Hermes, no MCP — just JSON over Unix socket and one HTTP call per question.
+    if [ "$USE_BRIDGE" = "true" ]; then
+      # Bridge roles (Architect, Dissenter, Muse) run as Python processes talking
+      # directly to the relay hub. No Claude Code session needed.
       local q_bridge
-      q_bridge="$(printf '%q' "$FOREMAN_DIR/scripts/foreman-muse-bridge.py")"
+      q_bridge="$(printf '%q' "$BRIDGE_SCRIPT")"
       cat > "$tmpscript" <<SCRIPT
 #!/usr/bin/env zsh
 cd $q_cwd
-echo "[muse] Starting Gemma4 bridge..."
+echo "[${SESSION_NAME}] Starting bridge..."
 exec python3 $q_bridge --model $q_model
 SCRIPT
     else
       # All other autonomous roles use Claude with full permission bypass.
       # The project .claude/settings.json pre-approves all tools so nothing prompts.
+      # Build the full init message (protocol + role + startup instructions).
+      {
+        cat "$PROTOCOL_FILE"
+        echo ""
+        echo "---"
+        echo ""
+        cat "$ROLE_FILE"
+        echo ""
+        echo "---"
+        echo ""
+        echo "STARTUP SEQUENCE — execute immediately, in order:"
+        echo "1. relay_rename new_name=\"$SESSION_NAME\""
+        echo "2. relay_ask to=\"foreman-orchestrator\" question=\"$SESSION_NAME is online and ready\""
+        echo "3. relay_listen(timeout_ms=300000) — block until a message arrives"
+        echo "4. Handle the message per your role, then relay_reply with your result"
+        echo "5. Return to step 3. Continue this loop until you receive a shutdown signal."
+        if [ "$USE_WORKTREE" = "true" ] && [ -n "$WORKTREE_PATH" ]; then
+          echo ""
+          echo "Your worktree path: $WORKTREE_PATH — cd here before doing any work."
+          echo "Your branch: $WORKTREE_BRANCH"
+        fi
+      } > "$tmpdir/init_msg.txt"
+
+      local q_work_cwd
+      if [ "$USE_WORKTREE" = "true" ] && [ -n "$WORKTREE_PATH" ]; then
+        q_work_cwd="$(printf '%q' "$WORKTREE_PATH")"
+      else
+        q_work_cwd="$q_cwd"
+      fi
       cat > "$tmpscript" <<SCRIPT
 #!/usr/bin/env zsh
-cd $q_cwd
+cd $q_work_cwd
 _MSG=\$(cat $q_tmpdir/init_msg.txt)
 claude --model $q_model --dangerously-skip-permissions -p "\$_MSG"
 exec zsh

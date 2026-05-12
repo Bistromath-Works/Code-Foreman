@@ -13,54 +13,54 @@ Claude Relay must be installed as a Claude Code plugin. See `references/relay-se
 
 ## Roles
 
-Five distinct roles, each running as a separate Claude Code session connected via Relay.
+Eight roles, each running as a separate session connected via Relay.
 
 | Role | Model | Count | Purpose |
 |------|-------|-------|---------|
-| Orchestrator | Opus | 1 | Plans, delegates, tracks, approves. The foreman. |
-| Dissenter | Opus | 1 | Challenges plans before execution and results before commit. |
-| Worker | Sonnet | 1+ | Builds. Scaled by the Orchestrator based on job scope. |
-| Cleaner | Haiku | 1 | Continuous tidying plus final sweep at job completion. |
-| Circuit Breaker | Haiku | 1 | Monitors all relay traffic for loops and forces resolution. |
-| Muse | Gemma 4 (Ollama) | 0-1 | Reframes problems, offers lateral perspective. Optional. |
+| Orchestrator | Opus 4.6 | 1 | Approves plans, delegates, tracks, reports. The foreman. |
+| Architect | Qwen3.5 (Ollama) | 1 | Reads codebase, writes CURRENT_PLAN.md. Python bridge. |
+| Dissenter | Gemini 3.1 Pro | 1 | Challenges plans (First Principles first) and results. Python bridge. |
+| Inspector | Opus 4.7 | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
+| Worker | Sonnet | 1+ | Builds in isolated git worktrees. Scaled by Orchestrator. |
+| Cleaner | Haiku | 1 | Tidies after Inspector clears. Final sweep only. |
+| Circuit Breaker | Haiku | 1 | Monitors all relay traffic for loops, including plan approval. |
+| Muse | Gemma 4 (Ollama) | 1 | Reframes. Invoked on disagreements. Pre-spawned. Python bridge. |
 
 Load role-specific instructions from `references/roles/` when bootstrapping each session.
 
 ## How It Works
 
 ### 1. You Give the Goal
+Tell the Orchestrator what to build. You only talk to the Orchestrator.
 
-Tell the Orchestrator what to build. One sentence or a full spec. The Orchestrator is the only agent you talk to directly. You have read-only status access to any agent, but all directives go through the Orchestrator.
+### 2. Architect Writes the Plan
+The Orchestrator hands the goal to the Architect. The Architect reads the codebase (read-only) and writes `CURRENT_PLAN.md`.
 
-### 2. Orchestrator Plans
+### 3. Plan Approval Loop
+The Orchestrator sends the plan to the Dissenter. The Dissenter challenges premise first (First Principles), then approach.
 
-The Orchestrator breaks the goal into discrete tasks, determines how many workers are needed, and drafts an implementation plan.
-
-### 3. Dissenter Reviews the Plan
-
-Before any code is written, the Orchestrator sends the plan summary to the Dissenter. The Dissenter challenges the reasoning: architectural decisions, dependency choices, interface designs, potential failure modes. The Dissenter works from summaries only and never accesses the filesystem directly.
-
-The Orchestrator tags tasks as **substantive** or **minor**. Only substantive tasks go through dissent review. Trivial work (renaming, config updates, formatting) skips dissent.
+If the Orchestrator and Dissenter cannot resolve a disagreement after one round, the Orchestrator invokes the Muse for a lateral perspective before making a final call. The Orchestrator holds final authority. The Circuit Breaker monitors this loop with the same escalation ladder as all other relay traffic.
 
 ### 4. Orchestrator Staffs the Job Site
-
-After the plan survives dissent, the Orchestrator spawns worker sessions using the bootstrap script. Each worker launches in the current project directory with its role-specific CLAUDE.md loaded.
+After plan approval, the Orchestrator spawns Workers via the bootstrap script. Each Worker gets an isolated git worktree. The Architect, Dissenter, Muse, and Circuit Breaker are pre-spawned at startup.
 
 ### 5. Workers Build
-
-Workers execute assigned tasks independently. They do not consult the Orchestrator for mid-implementation decisions. Sonnet is capable of making reasonable choices on its own. Workers can ask each other questions via Relay when their tasks have dependencies.
+Workers execute assigned tasks in their worktrees. They coordinate laterally with each other and can ping the Architect directly for plan clarification. The Orchestrator stays out of implementation decisions.
 
 ### 6. Cleaner Runs Continuously
+The Cleaner keeps the job site tidy throughout the build. Its final deep sweep runs *after* the Inspector clears.
 
-The Cleaner operates in the background throughout the build: removing dead code, organizing imports, fixing lint errors, stripping debug artifacts. Think of it as the crew member keeping the job site clear so workers can focus. A final deep sweep runs when the Orchestrator declares the goal complete.
+### 7. Architect Conformance Review
+When Workers complete, the Architect checks whether the implementation matches `CURRENT_PLAN.md`. It reads the actual changed files.
 
-### 7. Dissenter Reviews Results
+### 8. Inspector Audit
+The Inspector (Opus 4.7) reads everything: the plan, all changed files, affected existing code. Audit covers correctness, security, and plan conformance. A BLOCK finding halts the commit until fixed. Nothing bypasses the Inspector without an explicit Orchestrator override recorded in `DECISIONS.md`.
 
-Before commit, the Orchestrator sends completed work summaries back to the Dissenter for a second review. Same rules: logic and reasoning review only, no filesystem access, summaries only.
+### 9. Cleaner Final Sweep
+After Inspector clearance, the Cleaner runs its final sweep: lint, dead code, imports, formatting.
 
-### 8. Orchestrator Approves and Reports
-
-The Orchestrator gives final approval, coordinates the commit, and reports results back to you.
+### 10. Orchestrator Reports
+The Orchestrator reports completion to you and signals readiness for PR. You run `/dev-go` when you are ready to open it. The crew does not open PRs automatically.
 
 ## Circuit Breaker Protocol
 
@@ -82,13 +82,11 @@ The Muse runs Gemma 4 via Ollama, not Claude. It thinks differently at the weigh
 
 **How agents use the Muse:** Any agent can ping `foreman-muse` via `relay_ask` when they want a reframe. The Muse responds with one short observation, question, or metaphor, then goes quiet. It does not initiate conversations, write code, or make decisions.
 
-**When the Orchestrator should spawn the Muse:**
-- Before a major architectural decision where the obvious choices feel limiting
-- When the crew has been stuck on the same problem for multiple cycles
-- When the Dissenter and Orchestrator are approaching a loop and a fresh perspective might prevent it
-- When the owner asks for it
+The Muse is pre-spawned at crew startup alongside the Orchestrator, Architect, Dissenter, and Circuit Breaker. It is always available.
 
-The Muse is the only role that is not always on the job site. It shows up when needed and goes back to its coffee.
+**Structured trigger:** When the Orchestrator and Dissenter cannot resolve a plan disagreement after one round, the Orchestrator invokes the Muse before making a final call. This is the primary structural use.
+
+**Any-time use:** Any agent can ping `foreman-muse` via `relay_ask` when stuck. The Muse responds with one short observation, question, or metaphor, then goes quiet.
 
 ## Communication Norms
 
@@ -109,12 +107,17 @@ Run `cat scripts/foreman-bootstrap.sh` to review the bootstrap script before fir
 ### Session Naming Convention
 
 Sessions auto-register with Relay using these names:
-- `foreman-orchestrator`
-- `foreman-dissenter`
-- `foreman-worker-1`, `foreman-worker-2`, ...
-- `foreman-cleaner`
-- `foreman-circuit-breaker`
-- `foreman-muse` (when spawned)
+
+| Session name | Role |
+|---|---|
+| `foreman-orchestrator` | Orchestrator |
+| `foreman-architect` | Architect |
+| `foreman-dissenter` | Dissenter |
+| `foreman-inspector` | Inspector |
+| `foreman-worker-1`, `foreman-worker-2`, ... | Workers |
+| `foreman-cleaner` | Cleaner |
+| `foreman-circuit-breaker` | Circuit Breaker |
+| `foreman-muse` | Muse |
 
 Use `relay_peers` to verify the crew is connected.
 
