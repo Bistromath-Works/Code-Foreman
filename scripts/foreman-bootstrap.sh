@@ -149,9 +149,9 @@ SCRIPT
         echo "STARTUP SEQUENCE — execute immediately, in order:"
         echo "1. relay_rename new_name=\"$SESSION_NAME\""
         echo "2. relay_ask to=\"foreman-orchestrator\" question=\"$SESSION_NAME is online and ready\""
-        echo "3. relay_listen(timeout_ms=300000) — block until a message arrives"
+        echo "3. relay_listen(timeout_ms=5000) — await your first task assignment from the Orchestrator"
         echo "4. Handle the message per your role, then relay_reply with your result"
-        echo "5. Return to step 3. Continue this loop until you receive a shutdown signal."
+        echo "5. Continue working. After each task chunk or tool-call sequence, call relay_listen() to drain pending messages. When you receive a notifications/claude/channel push, call relay_listen() immediately to handle it."
         if [ "$USE_WORKTREE" = "true" ] && [ -n "$WORKTREE_PATH" ]; then
           echo ""
           echo "Your worktree path: $WORKTREE_PATH — cd here before doing any work."
