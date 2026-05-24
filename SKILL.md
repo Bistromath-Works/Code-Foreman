@@ -20,7 +20,7 @@ Eight roles, each running as a separate session connected via Relay.
 | Orchestrator | Opus 4.6 | 1 | Approves plans, delegates, tracks, reports. The foreman. |
 | Architect | Qwen3.5 (Ollama) | 1 | Reads codebase, writes CURRENT_PLAN.md. Python bridge. |
 | Dissenter | Gemini 3.1 Pro | 1 | Challenges plans (First Principles first) and results. Python bridge. |
-| Inspector | Opus 4.7 | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
+| Inspector | Codex CLI (OpenAI) | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
 | Worker | Sonnet | 1+ | Builds in isolated git worktrees. Scaled by Orchestrator. |
 | Cleaner | Haiku | 1 | Tidies after Inspector clears. Final sweep only. |
 | Circuit Breaker | Haiku | 1 | Monitors all relay traffic for loops, including plan approval. |

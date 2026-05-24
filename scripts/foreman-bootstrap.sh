@@ -4,8 +4,16 @@
 #
 # Usage:
 #   ./foreman-bootstrap.sh <role> [worker-number]
+#   ./foreman-bootstrap.sh --list-roles
 
 set -euo pipefail
+
+VALID_ROLES=(orchestrator architect dissenter inspector worker cleaner circuit-breaker muse)
+
+if [[ "${1:-}" == "--list-roles" ]]; then
+  printf '%s\n' "${VALID_ROLES[@]}"
+  exit 0
+fi
 
 ROLE="${1:?Usage: foreman-bootstrap.sh <role> [worker-number]}"
 WORKER_NUM="${2:-}"
@@ -14,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FOREMAN_DIR="$(dirname "$SCRIPT_DIR")"
 
 USE_BRIDGE=false
+USE_CODEX=false
 USE_WORKTREE=false
 BRIDGE_SCRIPT=""
 WORKTREE_PATH=""
@@ -40,9 +49,10 @@ case "$ROLE" in
     BRIDGE_SCRIPT="$FOREMAN_DIR/scripts/foreman-dissenter-bridge.py"
     ;;
   inspector)
-    MODEL="claude-opus-4-7"
+    MODEL=""
     SESSION_NAME="foreman-inspector"
     ROLE_FILE="$FOREMAN_DIR/references/roles/inspector.md"
+    USE_CODEX=true
     ;;
   worker)
     MODEL="sonnet"
@@ -71,7 +81,7 @@ case "$ROLE" in
     ;;
   *)
     echo "Error: Unknown role '$ROLE'"
-    echo "Valid roles: orchestrator, architect, dissenter, inspector, worker, cleaner, circuit-breaker, muse"
+    echo "Valid roles: ${VALID_ROLES[*]}"
     exit 1
     ;;
 esac
@@ -132,6 +142,32 @@ SCRIPT
 cd $q_cwd
 echo "[${SESSION_NAME}] Starting bridge..."
 exec python3 $q_bridge --model $q_model
+SCRIPT
+    elif [ "$USE_CODEX" = "true" ]; then
+      # Inspector runs as a Codex CLI session with relay MCP wired in.
+      local q_codex
+      q_codex="$(printf '%q' "/Applications/Codex.app/Contents/Resources/codex")"
+      {
+        cat "$PROTOCOL_FILE"
+        echo ""
+        echo "---"
+        echo ""
+        cat "$ROLE_FILE"
+        echo ""
+        echo "---"
+        echo ""
+        echo "STARTUP SEQUENCE — execute immediately, in order:"
+        echo "1. Call the relay_rename MCP tool with new_name=\"$SESSION_NAME\""
+        echo "2. Call relay_ask with to=\"foreman-orchestrator\" and question=\"$SESSION_NAME is online and ready\""
+        echo "3. Call relay_listen with timeout_ms=5000 — await your first task assignment from the Orchestrator"
+        echo "4. Handle the message per your role; call relay_reply with your result"
+        echo "5. Continue working. After each task chunk, call relay_listen() to drain pending messages."
+      } > "$tmpdir/init_msg.txt"
+      cat > "$tmpscript" <<SCRIPT
+#!/usr/bin/env zsh
+cd $q_cwd
+$q_codex exec -s workspace-write - < $q_tmpdir/init_msg.txt
+exec zsh
 SCRIPT
     else
       # All other autonomous roles use Claude with full permission bypass.
