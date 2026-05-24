@@ -114,10 +114,27 @@ spawn_session() {
   if [ "$ROLE" = "orchestrator" ]; then
     # Interactive — the human talks to this session directly.
     # No -p, no permission bypass: the user is in the loop here.
+    # Inject protocol + role as system context so Claude knows it's the Orchestrator
+    # and has relay tools available from the start.
+    {
+      cat "$PROTOCOL_FILE"
+      echo ""
+      echo "---"
+      echo ""
+      cat "$ROLE_FILE"
+      echo ""
+      echo "---"
+      echo ""
+      echo "STARTUP: When the user gives you a goal, begin the Foreman workflow immediately:"
+      echo "1. relay_rename new_name=\"foreman-orchestrator\""
+      echo "2. Proceed with Step 1 of your role (commission the plan via relay_ask to the Architect)."
+    } > "$tmpdir/orchestrator_ctx.txt"
+    local q_ctx
+    q_ctx="$(printf '%q' "$tmpdir/orchestrator_ctx.txt")"
     cat > "$tmpscript" <<SCRIPT
 #!/usr/bin/env zsh
 cd $q_cwd
-exec claude --model $q_model
+exec claude --model $q_model --append-system-prompt-file $q_ctx
 SCRIPT
 
   else
