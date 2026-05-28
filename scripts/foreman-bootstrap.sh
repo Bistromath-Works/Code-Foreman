@@ -166,7 +166,7 @@ SCRIPT
       cat > "$tmpscript" <<SCRIPT
 #!/usr/bin/env zsh
 cd $q_cwd
-$q_codex exec -s workspace-write - < $q_tmpdir/init_msg.txt
+$q_codex exec -s workspace-write -m gpt-5.3-codex -c model_reasoning_effort="high" - < $q_tmpdir/init_msg.txt
 exec zsh
 SCRIPT
     else

@@ -23,7 +23,7 @@ And then there is the Muse, who runs on an entirely different model, does not ap
 | **Orchestrator** | Claude Opus 4.6 | Approves plans, delegates, tracks, reports | Write code, ever, under any circumstances |
 | **Architect** | Qwen3.5 (Ollama) | Reads codebase, writes `CURRENT_PLAN.md` | Touch the repo during the build |
 | **Dissenter** | Gemini 3.1 Pro | Challenges plans (First Principles first) and results | Touch the filesystem or look at actual code |
-| **Inspector** | Claude Opus 4.7 | Full audit: correctness, security, plan conformance | Rubber-stamp anything |
+| **Inspector** | gpt-5.3-codex (Codex CLI, high reasoning) | Full audit: correctness, security, plan conformance | Rubber-stamp anything |
 | **Worker** | Claude Sonnet | Builds in isolated git worktrees | Argue about architecture (that ship has sailed) |
 | **Cleaner** | Claude Haiku | Linting, formatting, dead code removal | Modify application logic |
 | **Circuit Breaker** | Claude Haiku | Detects and resolves conversational loops | Take sides until forced to |
@@ -37,6 +37,7 @@ You will need:
 2. [Claude Relay](https://github.com/innestic/claude-relay) installed as a plugin
 3. A `GEMINI_API_KEY` environment variable set (for the Dissenter — get one at [aistudio.google.com](https://aistudio.google.com/app/apikey))
 4. [Ollama](https://ollama.com) with `qwen3.5` and `gemma4` pulled (for the Architect and Muse — optional but recommended)
+5. [Codex](https://openai.com/codex) desktop app with an OpenAI API key (for the Inspector)
 
 ## Quick Start
 
@@ -71,7 +72,7 @@ The workflow is, in principle, simple. In practice it is also simple, which is w
 4. **Workers build.** Each Worker gets an isolated git worktree. They make their own implementation decisions without checking in on every variable name. They are, after all, competent.
 5. **The Cleaner cleans.** Continuously. Like the tide, but for dead code.
 6. **The Architect checks conformance.** When Workers complete, the Architect verifies the implementation matches `CURRENT_PLAN.md`.
-7. **The Inspector audits.** The Inspector (Opus 4.7) reads everything — the plan, all changed files, affected existing code. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
+7. **The Inspector audits.** The Inspector (gpt-5.3-codex, high reasoning) reads everything — the plan, all changed files, affected existing code. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
 8. **The Cleaner does a final sweep.** After Inspector clearance: lint, dead code, imports, formatting.
 9. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
 10. **The Orchestrator approves.** You get your code.
