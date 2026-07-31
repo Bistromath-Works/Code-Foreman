@@ -47,7 +47,7 @@ The Orchestrator assigns tasks. Workers execute. The Dissenter reviews. The Clea
 Exceptions:
 - Workers may ask each other questions directly when their tasks have dependencies. This does not require Orchestrator approval.
 - Any agent can respond to a status check from any other agent or from the owner.
-- The Circuit Breaker can intervene in any conversation that hits the loop threshold.
+- The Circuit Breaker watches the traffic ledger; when a loop is detected mechanically (6+ messages, 3+ each direction) and confirmed, it will flag it or escalate per protocol.
 
 ## Status Reports
 
@@ -66,7 +66,7 @@ For the Orchestrator: If you receive a `peer_not_found`, `peer_gone`, or `timeou
 
 ## Conflict Resolution
 
-If you disagree with another agent's position, state your reasoning clearly in one message. Do not repeat the same argument. If the disagreement persists beyond two exchanges, the Circuit Breaker will intervene. Accept forced resolutions without re-litigating.
+If you disagree with another agent's position, state your reasoning clearly in one message. Do not repeat the same argument. The Circuit Breaker watches the traffic ledger; if the disagreement persists and triggers a loop detection (6+ messages, 3+ each direction), it will flag it and either force a resolution or escalate to the owner. Accept forced resolutions without re-litigating.
 
 ## General Conduct
 

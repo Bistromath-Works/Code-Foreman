@@ -23,7 +23,7 @@ Eight roles, each running as a headless background process connected via Relay.
 | Inspector | Opus (configurable) | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
 | Worker | Sonnet (configurable) | 1+ | Builds in isolated git worktrees. Scaled by Orchestrator. |
 | Cleaner | Haiku (configurable) | 1 | Tidies after Inspector clears. Final sweep only. |
-| Circuit Breaker | Haiku (configurable) | 1 | Monitors all relay traffic for loops, including plan approval. |
+| Circuit Breaker | Haiku (configurable) | 1 | Reads traffic ledger; detects loops mechanically; judges via confirm/arbiter models. |
 | Muse | Haiku (configurable) | 1 | Reframes. Invoked on disagreements. Pre-spawned. |
 
 Models and backends are configured in `foreman.config.json` (see references/architecture.md for details). Role-specific instructions are loaded from `references/roles/` when each crew member starts.
@@ -64,13 +64,13 @@ The Orchestrator reports completion to you and signals readiness for PR. You run
 
 ## Circuit Breaker Protocol
 
-The Circuit Breaker is a passive monitor on all Relay traffic. It watches for repetitive exchanges between any two agents on the same topic.
+The Circuit Breaker reads the traffic ledger (`.foreman/traffic.jsonl`) and detects loops mechanically: a sliding 15-minute window per agent pair trips at ≥6 messages with ≥3 in each direction. When a trip is detected, a confirm model (default Haiku) is invoked once to verify it is a real loop (false positives are suppressed). If the loop continues, an arbiter model issues a binding forced resolution. If the Orchestrator is a party to the loop or the arbiter is unconfigured/unreachable, the Circuit Breaker escalates to you (the owner) for a decision instead.
 
 **Escalation ladder:**
 
-- **3 round-trips** on the same topic between the same agents: Circuit Breaker sends a flag message summarizing both positions and directing the agents to resolve it.
-- **4 round-trips**: Circuit Breaker forces a decision by selecting the position with the strongest justification and instructing both agents to accept it and move on.
-- **Exception**: If the Orchestrator is one of the looping agents, the Circuit Breaker escalates to you (the owner) at round-trip 4 instead of forcing a decision. You make the call.
+- **Confirmed trip** (after confirm model call): Flag message sent to both agents directing them to resolve it.
+- **4+ messages after flag**: Arbiter model forces a binding decision by selecting the position with stronger justification.
+- **Exception**: If the Orchestrator is one of the looping agents, or if the arbiter is unconfigured/unreachable, the Circuit Breaker escalates to the owner via the Orchestrator. You make the call.
 
 The Circuit Breaker notifies the Orchestrator of every intervention so the Orchestrator maintains a record of forced resolutions.
 
@@ -131,6 +131,8 @@ Crew members auto-register with Relay using these names:
 Every crew member's model and backend are configured in `foreman.config.json`. This file defines defaults for all roles and allows per-role overrides.
 
 **Supported backends:** `claude-cli` (headless Claude), `claude-interactive` (Orchestrator only), `codex-cli`, `openai-compatible` (Ollama, OpenAI, OpenRouter, LM Studio, vLLM, etc.). See `references/architecture.md` for full config schema and examples.
+
+**Circuit Breaker arbiter:** The circuit-breaker role includes an `arbiter` config block for the model that issues binding forced resolutions; it must be set to a frontier-class model (Opus 4.8-level or better, e.g., GLM 5.2 or Kimi 2.6 cloud via Ollama/OpenRouter). The config ships with `"model": "SET-ME"` on purpose—users must choose their own arbiter.
 
 **Per-project overrides:** Place a `.foreman/config.json` in your project directory to override specific roles without editing the skill-level config.
 

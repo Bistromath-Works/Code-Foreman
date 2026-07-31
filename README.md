@@ -26,7 +26,7 @@ And then there is the Muse, who runs on an entirely different model, does not ap
 | **Inspector** | Opus (configurable) | Full audit: correctness, security, plan conformance | Rubber-stamp anything |
 | **Worker** | Sonnet (configurable) | Builds in isolated git worktrees | Argue about architecture (that ship has sailed) |
 | **Cleaner** | Haiku (configurable) | Linting, formatting, dead code removal | Modify application logic |
-| **Circuit Breaker** | Haiku (configurable) | Detects and resolves conversational loops | Take sides until forced to |
+| **Circuit Breaker** | Haiku (configurable) | Reads traffic ledger; judges loop disputes via confirm/arbiter models | Take sides until forced to |
 | **Muse** | Haiku (configurable) | Reframes problems sideways | Anything resembling real work |
 
 ## Prerequisites
@@ -78,7 +78,7 @@ The workflow is, in principle, simple. In practice it is also simple, which is w
 9. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
 10. **The Orchestrator approves.** You get your code.
 
-The Circuit Breaker watches all of this passively and intervenes only when two agents have gone back and forth three times on the same point without progress. At four round-trips, it forces a decision. Unless the Orchestrator is one of the looping parties, in which case it escalates to you, because even on a construction site, sometimes the foreman needs the owner to make a call.
+The Circuit Breaker reads the traffic ledger and mechanically detects loops (sliding 15-minute window per agent pair). When a loop is confirmed, it flags both agents. If they continue looping, an arbiter model forces a binding decision. If the Orchestrator is one of the looping parties or the arbiter is unconfigured, it escalates to you instead, because even on a construction site, sometimes the foreman needs the owner to make a call.
 
 The Muse sits off to the side and offers a completely different perspective when asked. It is most effective when configured to run on a different model family (via `foreman.config.json`), which means it literally thinks differently. This is not a metaphor. The weights are different. The latent space is different. It will say things the Claude agents would not think of, and occasionally those things will be exactly what was needed.
 
@@ -92,10 +92,13 @@ foreman.sh spawn worker <n>         # Create worker-<n> worktree and launch its 
 foreman.sh stop                     # Terminate all crew member processes
 foreman.sh status                   # Check liveness and last log line for each crew member
 foreman.sh logs <role> [-f]         # Print or follow logs for a role (e.g., logs architect, logs worker-1 -f)
+foreman.sh traffic [-f]             # Pretty-print (or follow) the traffic ledger—flight recorder for post-mortems
 foreman.sh clean                    # Remove worktrees (fails if uncommitted changes present) + prune
 ```
 
 Worker worktrees live under `.foreman/worktrees/worker-<n>/` within your project. `foreman.sh clean` removes them when you are done. Log files are in `.foreman/logs/`; `foreman.sh` keeps the whole `.foreman/` directory out of `git status` for you (via `.git/info/exclude`).
+
+The traffic ledger (`.foreman/traffic.jsonl`) is a complete record of all crew conversation—every message that passes through a runner is logged. This is the job site's flight recorder; use `foreman.sh traffic [-f]` to replay it for post-mortems or to understand how a decision was reached.
 
 ## File Structure
 
@@ -139,7 +142,7 @@ In the spirit of honesty, which is a trait undervalued in README files:
 - **Single repo only.** All agents work in the same project directory. Cross-repo coordination is a v2 problem.
 - **No persistence.** When you run `foreman.sh stop`, the crew is gone. Each job is a fresh start.
 - **Same host only.** Relay uses Unix sockets. Your agents all live on one machine.
-- **Circuit Breaker visibility.** Relay delivers directed messages; the Circuit Breaker cannot passively observe all conversations (see `references/architecture.md` Known Limitations for details).
+- **Circuit Breaker arbiter unconfigured.** The arbiter model (for forced resolutions) ships with `"model": "SET-ME"` deliberately—users must choose a frontier-class model (Opus 4.8-level or better). Until configured, stalemates escalate to you.
 - **Headless agent communication.** Crew members communicate via directive lines (`@ask foreman-<peer>: <question>`) in their responses rather than direct MCP tool calls. See `references/protocol.md` for details.
 
 ## Credits
