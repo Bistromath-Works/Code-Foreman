@@ -20,14 +20,14 @@ And then there is the Muse, who runs on an entirely different model, does not ap
 
 | Role | Model | What They Do | What They Emphatically Do Not Do |
 |------|-------|-------------|----------------------------------|
-| **Orchestrator** | Claude Opus 4.6 | Approves plans, delegates, tracks, reports | Write code, ever, under any circumstances |
-| **Architect** | Qwen3.5 (Ollama) | Reads codebase, writes `CURRENT_PLAN.md` | Touch the repo during the build |
-| **Dissenter** | Gemini 3.1 Pro | Challenges plans (First Principles first) and results | Touch the filesystem or look at actual code |
-| **Inspector** | gpt-5.3-codex (Codex CLI, high reasoning) | Full audit: correctness, security, plan conformance | Rubber-stamp anything |
-| **Worker** | Claude Sonnet | Builds in isolated git worktrees | Argue about architecture (that ship has sailed) |
-| **Cleaner** | Claude Haiku | Linting, formatting, dead code removal | Modify application logic |
-| **Circuit Breaker** | Claude Haiku | Detects and resolves conversational loops | Take sides until forced to |
-| **Muse** | Gemma 4 (Ollama) | Reframes problems sideways | Anything resembling real work |
+| **Orchestrator** | Opus (configurable) | Approves plans, delegates, tracks, reports | Write code, ever, under any circumstances |
+| **Architect** | Sonnet (configurable) | Reads codebase, writes `CURRENT_PLAN.md` | Touch the repo during the build |
+| **Dissenter** | Sonnet (configurable) | Challenges plans (First Principles first) and results | Touch the filesystem or look at actual code |
+| **Inspector** | Opus (configurable) | Full audit: correctness, security, plan conformance | Rubber-stamp anything |
+| **Worker** | Sonnet (configurable) | Builds in isolated git worktrees | Argue about architecture (that ship has sailed) |
+| **Cleaner** | Haiku (configurable) | Linting, formatting, dead code removal | Modify application logic |
+| **Circuit Breaker** | Haiku (configurable) | Reads traffic ledger; judges loop disputes via confirm/arbiter models | Take sides until forced to |
+| **Muse** | Haiku (configurable) | Reframes problems sideways | Anything resembling real work |
 
 ## Prerequisites
 
@@ -35,9 +35,8 @@ You will need:
 
 1. [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (2.1.80 or later, though frankly the version number is changing so fast that by the time you read this sentence it may already be wrong)
 2. [Claude Relay](https://github.com/innestic/claude-relay) installed as a plugin
-3. A `GEMINI_API_KEY` environment variable set (for the Dissenter — get one at [aistudio.google.com](https://aistudio.google.com/app/apikey))
-4. [Ollama](https://ollama.com) with `qwen3.5` and `gemma4` pulled (for the Architect and Muse — optional but recommended)
-5. [Codex](https://openai.com/codex) desktop app with an OpenAI API key (for the Inspector)
+
+By default, all crew members run on Claude via the Claude Code backend. Support for other models (Ollama, OpenAI, OpenRouter, LM Studio, vLLM, or other OpenAI-compatible endpoints) is optional and configured in `foreman.config.json`.
 
 ## Quick Start
 
@@ -52,15 +51,17 @@ The quickest way to understand Foreman is to watch it work.
 
 **Step 2.** Install the Foreman skill. (Place the `foreman/` directory in your Claude Code skills path.)
 
-**Step 3.** Open Claude Code in your project directory with the Relay channel flag:
+**Step 3.** Navigate to your project directory and run:
 ```bash
-claude --dangerously-load-development-channels plugin:relay@claude-relay
+./scripts/foreman.sh start
 ```
 
-**Step 4.** Say something like:
-> "Spin up Foreman. Build me a REST API for user authentication with JWT tokens, bcrypt password hashing, and refresh token rotation."
+This spawns the entire crew as background processes and drops you into an interactive Orchestrator session. The crew is now running headlessly, which is to say they are invisible but very much present. You can verify this by running `foreman.sh status` in another terminal if you want proof that they are actually there and not just polite fiction.
 
-**Step 5.** Watch in mild astonishment as terminal windows begin appearing, agents begin talking to each other, and code begins materializing in your project directory as if by magic, except that it is not magic, it is just several language models being very organized about it.
+**Step 4.** In the Orchestrator session, say something like:
+> "Build me a REST API for user authentication with JWT tokens, bcrypt password hashing, and refresh token rotation."
+
+**Step 5.** Sit back and experience the mild astonishment of agents talking to each other and code materializing in your project directory as if by magic, except that it is not magic, it is just several language models being very organized about it and also completely invisible about it.
 
 ## How It Works
 
@@ -69,50 +70,50 @@ The workflow is, in principle, simple. In practice it is also simple, which is w
 1. **You give the Orchestrator a goal.** This is the only agent you talk to. Chain of command exists for a reason.
 2. **The Architect writes the plan.** It reads your codebase (read-only), then writes a concrete, phased `CURRENT_PLAN.md`. No plan comes from thin air.
 3. **The Dissenter reviews the plan.** Before a single line of code is written, the Dissenter stress-tests the reasoning — First Principles first, then approach. Not the code. The *reasoning*. This is an important distinction that most review processes get wrong.
-4. **Workers build.** Each Worker gets an isolated git worktree. They make their own implementation decisions without checking in on every variable name. They are, after all, competent.
-5. **The Cleaner cleans.** Continuously. Like the tide, but for dead code.
-6. **The Architect checks conformance.** When Workers complete, the Architect verifies the implementation matches `CURRENT_PLAN.md`.
-7. **The Inspector audits.** The Inspector (gpt-5.3-codex, high reasoning) reads everything — the plan, all changed files, affected existing code. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
-8. **The Cleaner does a final sweep.** After Inspector clearance: lint, dead code, imports, formatting.
-9. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
-10. **The Orchestrator approves.** You get your code.
+4. **Workers build.** Each Worker gets an isolated git worktree. They make their own implementation decisions without checking in on every variable name. They are, after all, competent. They commit before reporting done — uncommitted work does not merge.
+5. **The Cleaner cleans.** Continuously, in worker worktrees on request. Like the tide, but for dead code.
+6. **The Orchestrator merges.** `foreman.sh merge` lands every worker branch onto `foreman-integration`, sequentially, so the reviews that follow actually see the work. A conflict blocks that one worker until it merges `foreman-integration` back into its own worktree and resolves; everyone else waits.
+7. **The Architect checks conformance.** Once merged, the Architect verifies `foreman-integration` matches `CURRENT_PLAN.md`.
+8. **The Inspector audits.** The Inspector reads everything — the plan, all changed files, affected existing code — on `foreman-integration`. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
+9. **The Cleaner does a final sweep.** After Inspector clearance, on `foreman-integration`: lint, dead code, imports, formatting — and commits that sweep itself.
+10. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
+11. **The Orchestrator approves.** You get your code, on `foreman-integration`, ready for a PR.
 
-The Circuit Breaker watches all of this passively and intervenes only when two agents have gone back and forth three times on the same point without progress. At four round-trips, it forces a decision. Unless the Orchestrator is one of the looping parties, in which case it escalates to you, because even on a construction site, sometimes the foreman needs the owner to make a call.
+The Circuit Breaker reads the traffic ledger and mechanically detects loops (sliding 15-minute window per agent pair). When a loop is confirmed, it flags both agents. If they continue looping, an arbiter model forces a binding decision. If the Orchestrator is one of the looping parties or the arbiter is unconfigured, it escalates to you instead, because even on a construction site, sometimes the foreman needs the owner to make a call.
 
-The Muse, if present, sits off to the side and offers a completely different perspective when asked. It runs Gemma 4, not Claude, which means it literally thinks differently. This is not a metaphor. The weights are different. The latent space is different. It will say things none of the Claude agents would think of, and occasionally those things will be exactly what was needed.
+The Muse sits off to the side and offers a completely different perspective when asked. It is most effective when configured to run on a different model family (via `foreman.config.json`), which means it literally thinks differently. This is not a metaphor. The weights are different. The latent space is different. It will say things the Claude agents would not think of, and occasionally those things will be exactly what was needed.
 
-## The Bootstrap Script
+## Lifecycle CLI
 
-The Orchestrator spawns crew members using `scripts/foreman-bootstrap.sh`. Each invocation opens a new terminal session with the correct model, role instructions, and Relay connection.
+The `scripts/foreman.sh` command manages the crew's lifecycle. All crew members (except the Orchestrator) run as headless background processes.
 
 ```bash
-# The Orchestrator handles this automatically, but if you are curious:
-./scripts/foreman-bootstrap.sh orchestrator
-./scripts/foreman-bootstrap.sh architect
-./scripts/foreman-bootstrap.sh dissenter
-./scripts/foreman-bootstrap.sh inspector
-./scripts/foreman-bootstrap.sh worker 1
-./scripts/foreman-bootstrap.sh worker 2
-./scripts/foreman-bootstrap.sh cleaner
-./scripts/foreman-bootstrap.sh circuit-breaker
-./scripts/foreman-bootstrap.sh muse
+foreman.sh start                    # Spawn core crew headlessly; launch interactive Orchestrator
+foreman.sh spawn worker <n>         # Create worker-<n> worktree and launch its process
+foreman.sh stop                     # Terminate all crew member processes
+foreman.sh status                   # Check liveness and last log line for each crew member
+foreman.sh logs <role> [-f]         # Print or follow logs for a role (e.g., logs architect, logs worker-1 -f)
+foreman.sh traffic [-f]             # Pretty-print (or follow) the traffic ledger—flight recorder for post-mortems
+foreman.sh clean                    # Remove worktrees (fails if uncommitted changes present) + prune
+foreman.sh merge [--abort|--skip <n>|<n>...]  # Land worker branches onto foreman-integration; --abort restores your pre-merge branch, --skip <n> drops a conflict block for manual handling
 ```
 
-Worker sessions create isolated git worktrees under `/tmp`. After a session completes, run `git worktree prune` to clean up any leftover branches.
+Worker worktrees live under `.foreman/worktrees/worker-<n>/` within your project. `foreman.sh clean` removes them when you are done. Log files are in `.foreman/logs/`; `foreman.sh` keeps the whole `.foreman/` directory out of `git status` for you (via `.git/info/exclude`).
+
+The traffic ledger (`.foreman/traffic.jsonl`) is a complete record of all crew conversation—every message that passes through a runner is logged. This is the job site's flight recorder; use `foreman.sh traffic [-f]` to replay it for post-mortems or to understand how a decision was reached.
 
 ## File Structure
 
 ```
 foreman/
 ├── SKILL.md                          # Main skill trigger and protocol
+├── foreman.config.json               # Role → backend/model mapping (defaults)
 ├── scripts/
-│   ├── foreman-bootstrap.sh          # Spawns crew sessions
-│   ├── foreman-architect-bridge.py   # Architect bridge (Qwen3.5 via Ollama)
-│   ├── foreman-dissenter-bridge.py   # Dissenter bridge (Gemini)
-│   └── foreman-muse-bridge.py        # Muse bridge (Gemma 4 via Ollama)
+│   ├── foreman.sh                    # Lifecycle CLI (start/spawn/stop/status/logs/clean/merge)
+│   └── foreman-runner.py             # Generic runner (one process per crew member)
 └── references/
     ├── protocol.md                   # Shared communication norms (all agents)
-    ├── relay-setup.md                # Relay installation guide
+    ├── architecture.md               # Headless design spec and config reference
     └── roles/
         ├── orchestrator.md           # The foreman
         ├── architect.md              # The planner
@@ -123,6 +124,8 @@ foreman/
         ├── circuit-breaker.md        # The conversation referee
         └── muse.md                   # The one making coffee
 ```
+
+Per-project runtime state (logs, PIDs, worker worktrees) lives in `.foreman/` within the project directory.
 
 ## Philosophy
 
@@ -139,9 +142,10 @@ This may seem like a small thing, but Douglas Adams once noted that the problem 
 In the spirit of honesty, which is a trait undervalued in README files:
 
 - **Single repo only.** All agents work in the same project directory. Cross-repo coordination is a v2 problem.
-- **No persistence.** When sessions close, the crew is gone. Each job is a fresh start.
+- **No persistence.** When you run `foreman.sh stop`, the crew is gone. Each job is a fresh start.
 - **Same host only.** Relay uses Unix sockets. Your agents all live on one machine.
-- **The bootstrap script may need tweaking.** CLI flags for Claude Code and Ollama evolve quickly. If a session fails to spawn, check the launch command first.
+- **Circuit Breaker arbiter unconfigured.** The arbiter model (for forced resolutions) ships with `"model": "SET-ME"` deliberately—users must choose a frontier-class model (Opus 4.8-level or better). Until configured, stalemates escalate to you.
+- **Headless agent communication.** Crew members communicate via directive lines (`@ask foreman-<peer>: <question>`) in their responses rather than direct MCP tool calls. See `references/protocol.md` for details.
 
 ## Credits
 

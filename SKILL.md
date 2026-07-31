@@ -13,20 +13,20 @@ Claude Relay must be installed as a Claude Code plugin. See `references/relay-se
 
 ## Roles
 
-Eight roles, each running as a separate session connected via Relay.
+Eight roles, each running as a headless background process connected via Relay.
 
 | Role | Model | Count | Purpose |
 |------|-------|-------|---------|
-| Orchestrator | Opus 4.6 | 1 | Approves plans, delegates, tracks, reports. The foreman. |
-| Architect | Qwen3.5 (Ollama) | 1 | Reads codebase, writes CURRENT_PLAN.md. Python bridge. |
-| Dissenter | Gemini 3.1 Pro | 1 | Challenges plans (First Principles first) and results. Python bridge. |
-| Inspector | Codex CLI (OpenAI) | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
-| Worker | Sonnet | 1+ | Builds in isolated git worktrees. Scaled by Orchestrator. |
-| Cleaner | Haiku | 1 | Tidies after Inspector clears. Final sweep only. |
-| Circuit Breaker | Haiku | 1 | Monitors all relay traffic for loops, including plan approval. |
-| Muse | Gemma 4 (Ollama) | 1 | Reframes. Invoked on disagreements. Pre-spawned. Python bridge. |
+| Orchestrator | Opus (configurable) | 1 | Approves plans, delegates, tracks, reports. The foreman. |
+| Architect | Sonnet (configurable) | 1 | Reads codebase, writes CURRENT_PLAN.md. |
+| Dissenter | Sonnet (configurable) | 1 | Challenges plans (First Principles first) and results. |
+| Inspector | Opus (configurable) | 1 | Full code audit (correctness, security, conformance). Blocks commit. |
+| Worker | Sonnet (configurable) | 1+ | Builds in isolated git worktrees. Scaled by Orchestrator. |
+| Cleaner | Haiku (configurable) | 1 | Tidies after Inspector clears. Final sweep only. |
+| Circuit Breaker | Haiku (configurable) | 1 | Reads traffic ledger; detects loops mechanically; judges via confirm/arbiter models. |
+| Muse | Haiku (configurable) | 1 | Reframes. Invoked on disagreements. Pre-spawned. |
 
-Load role-specific instructions from `references/roles/` when bootstrapping each session.
+Models and backends are configured in `foreman.config.json` (see references/architecture.md for details). Role-specific instructions are loaded from `references/roles/` when each crew member starts.
 
 ## How It Works
 
@@ -42,51 +42,52 @@ The Orchestrator sends the plan to the Dissenter. The Dissenter challenges premi
 If the Orchestrator and Dissenter cannot resolve a disagreement after one round, the Orchestrator invokes the Muse for a lateral perspective before making a final call. The Orchestrator holds final authority. The Circuit Breaker monitors this loop with the same escalation ladder as all other relay traffic.
 
 ### 4. Orchestrator Staffs the Job Site
-After plan approval, the Orchestrator spawns Workers via the bootstrap script. Each Worker gets an isolated git worktree. The Architect, Dissenter, Muse, and Circuit Breaker are pre-spawned at startup.
+After plan approval, the Orchestrator spawns Workers via the `foreman.sh spawn worker <n>` command. Each Worker gets an isolated git worktree. The Architect, Dissenter, Inspector, Cleaner, Circuit Breaker, and Muse are pre-spawned at startup via `foreman.sh start`.
 
 ### 5. Workers Build
-Workers execute assigned tasks in their worktrees. They coordinate laterally with each other and can ping the Architect directly for plan clarification. The Orchestrator stays out of implementation decisions.
+Workers execute assigned tasks in their worktrees. They coordinate laterally with each other and can ping the Architect directly for plan clarification. The Orchestrator stays out of implementation decisions. Workers commit their work before reporting completion — uncommitted changes never merge.
 
 ### 6. Cleaner Runs Continuously
-The Cleaner keeps the job site tidy throughout the build. Its final deep sweep runs *after* the Inspector clears.
+The Cleaner keeps the job site tidy throughout the build, working in worker worktrees on request. Its final deep sweep runs *after* the Inspector clears, and only then in the main project directory.
 
-### 7. Architect Conformance Review
-When Workers complete, the Architect checks whether the implementation matches `CURRENT_PLAN.md`. It reads the actual changed files.
+### 7. Orchestrator Merges
+The Orchestrator runs `foreman.sh merge` to land every worker's branch onto a `foreman-integration` branch. A conflict blocks merging until the affected Worker merges `foreman-integration` into its own worktree, resolves, and reports back — every other worker stays gated in the meantime. All review from here on reads this integrated tree.
 
-### 8. Inspector Audit
-The Inspector (Opus 4.7) reads everything: the plan, all changed files, affected existing code. Audit covers correctness, security, and plan conformance. A BLOCK finding halts the commit until fixed. Nothing bypasses the Inspector without an explicit Orchestrator override recorded in `DECISIONS.md`.
+### 8. Architect Conformance Review
+Once merged, the Architect checks whether the implementation matches `CURRENT_PLAN.md`. It reads the actual changed files on `foreman-integration`.
 
-### 9. Cleaner Final Sweep
-After Inspector clearance, the Cleaner runs its final sweep: lint, dead code, imports, formatting.
+### 9. Inspector Audit
+The Inspector reads everything: the plan, all changed files, affected existing code. Audit covers correctness, security, and plan conformance. A BLOCK finding halts the commit until fixed. Nothing bypasses the Inspector without an explicit Orchestrator override recorded in `DECISIONS.md`.
 
-### 10. Orchestrator Reports
-The Orchestrator reports completion to you and signals readiness for PR. You run `/dev-go` when you are ready to open it. The crew does not open PRs automatically.
+### 10. Cleaner Final Sweep
+After Inspector clearance, the Cleaner runs its final sweep on `foreman-integration`: lint, dead code, imports, formatting — and commits that sweep itself before reporting done.
+
+### 11. Orchestrator Reports
+The Orchestrator reports completion to you and signals readiness for PR from `foreman-integration`. You run `/dev-go` when you are ready to open it. The crew does not open PRs automatically.
 
 ## Circuit Breaker Protocol
 
-The Circuit Breaker is a passive monitor on all Relay traffic. It watches for repetitive exchanges between any two agents on the same topic.
+The Circuit Breaker reads the traffic ledger (`.foreman/traffic.jsonl`) and detects loops mechanically: a sliding 15-minute window per agent pair trips at ≥6 messages with ≥3 in each direction. When a trip is detected, a confirm model (default Haiku) is invoked once to verify it is a real loop (false positives are suppressed). If the loop continues, an arbiter model issues a binding forced resolution. If the Orchestrator is a party to the loop or the arbiter is unconfigured/unreachable, the Circuit Breaker escalates to you (the owner) for a decision instead.
 
 **Escalation ladder:**
 
-- **3 round-trips** on the same topic between the same agents: Circuit Breaker sends a flag message summarizing both positions and directing the agents to resolve it.
-- **4 round-trips**: Circuit Breaker forces a decision by selecting the position with the strongest justification and instructing both agents to accept it and move on.
-- **Exception**: If the Orchestrator is one of the looping agents, the Circuit Breaker escalates to you (the owner) at round-trip 4 instead of forcing a decision. You make the call.
+- **Confirmed trip** (after confirm model call): Flag message sent to both agents directing them to resolve it.
+- **4+ messages after flag**: Arbiter model forces a binding decision by selecting the position with stronger justification.
+- **Exception**: If the Orchestrator is one of the looping agents, or if the arbiter is unconfigured/unreachable, the Circuit Breaker escalates to the owner via the Orchestrator. You make the call.
 
 The Circuit Breaker notifies the Orchestrator of every intervention so the Orchestrator maintains a record of forced resolutions.
 
 ## The Muse
 
-The Muse is optional. The Orchestrator spawns it when the job feels like it could benefit from lateral thinking, or when the crew has been grinding on a hard problem and needs a different angle.
+The Muse is pre-spawned as part of the core crew. The Orchestrator (or any agent) can ask it for a lateral perspective when the crew feels stuck or needs a different angle.
 
-The Muse runs Gemma 4 via Ollama, not Claude. It thinks differently at the weights level. That is the point. It is not smarter than the crew. It sees sideways.
+The Muse is most effective when configured to run on a model family different from Claude (e.g., a local Ollama model). Running it on different weights creates genuinely different thinking patterns. That is the point. It is not smarter than the crew. It sees sideways.
 
-**How agents use the Muse:** Any agent can ping `foreman-muse` via `relay_ask` when they want a reframe. The Muse responds with one short observation, question, or metaphor, then goes quiet. It does not initiate conversations, write code, or make decisions.
-
-The Muse is pre-spawned at crew startup alongside the Orchestrator, Architect, Dissenter, and Circuit Breaker. It is always available.
+**How agents use the Muse:** Any agent can ask `foreman-muse` via `relay_ask` when they want a reframe. The Muse responds with one short observation, question, or metaphor, then goes quiet. It does not initiate conversations, write code, or make decisions.
 
 **Structured trigger:** When the Orchestrator and Dissenter cannot resolve a plan disagreement after one round, the Orchestrator invokes the Muse before making a final call. This is the primary structural use.
 
-**Any-time use:** Any agent can ping `foreman-muse` via `relay_ask` when stuck. The Muse responds with one short observation, question, or metaphor, then goes quiet.
+**Any-time use:** Any agent can ask the Muse when stuck on a problem. The Muse responds with one short thought, then goes quiet.
 
 ## Communication Norms
 
@@ -98,19 +99,29 @@ These norms are loaded into every session via the shared protocol file (`referen
 - **Workers talk laterally**: Workers with dependent tasks should coordinate directly with each other via Relay, not route everything through the Orchestrator.
 - **The Orchestrator delegates, not implements**: The Orchestrator never writes code or edits files. It plans, assigns, reviews, and approves.
 
-## Bootstrapping
+## Bootstrapping and Lifecycle
 
-The Orchestrator uses the bootstrap script at `scripts/foreman-bootstrap.sh` to spawn sessions. The script accepts a role name and launches a Claude Code session with the correct model flag, the shared protocol, and the role-specific CLAUDE.md.
+The `scripts/foreman.sh` CLI manages the crew's lifecycle. All crew members run as headless background processes under a generic runner (`scripts/foreman-runner.py`), with the exception of the Orchestrator, which remains an interactive Claude Code session.
 
-Run `cat scripts/foreman-bootstrap.sh` to review the bootstrap script before first use.
+### Lifecycle Commands
+
+| Command | What it does |
+|---------|-------------|
+| `foreman.sh start` | Spawn the core crew (architect, dissenter, inspector, cleaner, circuit-breaker, muse) as headless processes, then launch the interactive Orchestrator session. |
+| `foreman.sh spawn worker <n>` | Create a worker-specific git worktree and launch a Worker runner. Workers are spawned on demand by the Orchestrator. |
+| `foreman.sh stop` | Terminate all running crew member processes. Worktrees are left intact. |
+| `foreman.sh status` | Check liveness of each crew member (PID check) and print the last log line for each. |
+| `foreman.sh logs <role> [-f]` | Print or follow the log for a specific crew member (e.g., `logs architect`, `logs worker-1 -f`). |
+| `foreman.sh clean` | Remove all worker worktrees (refuses if any have uncommitted changes) and prune Relay state. |
+| `foreman.sh merge [--abort\|--skip <n>\|<n> ...]` | Merge worker branches into `foreman-integration`; `--abort` restores the pre-merge branch, `--skip <n>` clears a conflict block without merging that worker. |
 
 ### Session Naming Convention
 
-Sessions auto-register with Relay using these names:
+Crew members auto-register with Relay using these names:
 
 | Session name | Role |
 |---|---|
-| `foreman-orchestrator` | Orchestrator |
+| `foreman-orchestrator` | Orchestrator (interactive session — the only one you interact with directly) |
 | `foreman-architect` | Architect |
 | `foreman-dissenter` | Dissenter |
 | `foreman-inspector` | Inspector |
@@ -119,7 +130,15 @@ Sessions auto-register with Relay using these names:
 | `foreman-circuit-breaker` | Circuit Breaker |
 | `foreman-muse` | Muse |
 
-Use `relay_peers` to verify the crew is connected.
+## Configuration
+
+Every crew member's model and backend are configured in `foreman.config.json`. This file defines defaults for all roles and allows per-role overrides.
+
+**Supported backends:** `claude-cli` (headless Claude), `claude-interactive` (Orchestrator only), `codex-cli`, `openai-compatible` (Ollama, OpenAI, OpenRouter, LM Studio, vLLM, etc.). See `references/architecture.md` for full config schema and examples.
+
+**Circuit Breaker arbiter:** The circuit-breaker role includes an `arbiter` config block for the model that issues binding forced resolutions; it must be set to a frontier-class model (Opus 4.8-level or better, e.g., GLM 5.2 or Kimi 2.6 cloud via Ollama/OpenRouter). The config ships with `"model": "SET-ME"` on purpose—users must choose their own arbiter.
+
+**Per-project overrides:** Place a `.foreman/config.json` in your project directory to override specific roles without editing the skill-level config.
 
 ## Scope Control
 
@@ -139,5 +158,5 @@ All sessions spawn in the same project directory where the Orchestrator was laun
 
 - Not a CI/CD pipeline. It does not deploy.
 - Not a testing framework. Workers write tests as part of their tasks, but Foreman does not run test suites independently.
-- Not persistent. When sessions close, the crew is gone. Spin up fresh for each job.
+- Not persistent. When processes are stopped via `foreman.sh stop`, the crew is gone. Spin up fresh for each job.
 - Not cross-machine. All sessions run on the same host via Relay's Unix socket.
