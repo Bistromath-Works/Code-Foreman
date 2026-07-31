@@ -53,7 +53,10 @@ by editing the config.
     "worker":          { "backend": "claude-cli", "model": "sonnet" },
     "cleaner":         { "backend": "claude-cli", "model": "haiku" },
     "circuit-breaker": { "backend": "claude-cli", "model": "haiku",
-                         "allowed_tools": [] },
+                         "allowed_tools": [],
+                         "arbiter": { "backend": "openai-compatible",
+                                      "base_url": "http://127.0.0.1:11434/v1",
+                                      "model": "SET-ME", "api_key_env": "" } },
     "muse":            { "backend": "claude-cli", "model": "haiku",
                          "allowed_tools": [] }
   }
@@ -137,6 +140,59 @@ former bridge scripts and is isolated in the runner's `RelayClient` class; if
 the live hub rejects it, the error is logged and surfaced to the asking backend
 rather than crashing the runner.
 
+## Traffic Ledger and the Circuit Breaker
+
+Relay delivers directed messages, so no peer can passively observe all
+traffic. Instead, the runners record it: every message that touches a
+headless crew member passes through a runner, and since every conversation
+involves at least one headless member, coverage is complete.
+
+Each runner appends one JSON line per message to
+`<project>/.foreman/traffic.jsonl` (`{ts, from, to, kind: ask|reply,
+content}`; content truncated; O_APPEND writes, so no locking). The
+duplicate-free logging rule per runner:
+
+- every **inbound delivery** (the sender's runner does not log it), plus the
+  runner's own **reply** to it;
+- an **outbound ask** only when addressed to `foreman-orchestrator`, and the
+  **answer received** only when it came from `foreman-orchestrator` — the
+  Orchestrator's interactive session is the one place with no runner to log
+  the other end.
+
+Ledger writes are best-effort and never crash a runner. `foreman.sh traffic`
+pretty-prints the ledger — a flight recorder for post-mortems.
+
+### Circuit Breaker: mechanical detection, LLM judgment
+
+The `circuit-breaker` role no longer runs the generic message loop. Its
+runner tails the traffic ledger and detects loops *mechanically* (sliding
+15-minute window per agent pair; a pair trips at ≥6 messages with ≥3 in
+each direction). LLMs are invoked only at the moment of judgment:
+
+1. **Trip → confirm (the role's `model`, cheap).** One call: is this a real
+   loop, and what are the two positions? False positive → suppress and keep
+   watching. Real → send the flag message directing both agents to resolve.
+2. **Four more messages after the flag → arbitrate (the `arbiter` config
+   block).** The breaker assembles an evidence packet — the pair's
+   transcript, `CURRENT_PLAN.md`, `DECISIONS.md`, and any project files
+   named in the disputed messages (capped) — and the arbiter issues the
+   binding ruling, delivered to both agents and recorded with the
+   Orchestrator.
+3. **Escalation instead of ruling** when the Orchestrator is a party to the
+   loop, or when the arbiter is unconfigured/unreachable: the breaker asks
+   the Orchestrator to put the decision to the owner. An unconfigured
+   arbiter never silently downgrades to a weaker judge.
+
+The breaker still registers on the relay and answers status asks (with a
+mechanical summary — no LLM call).
+
+**Arbiter quality bar:** forced rulings overrule two strong agents and are
+binding, so the arbiter must be a frontier-class model — as capable as
+Claude Opus 4.8 or better (e.g. GLM 5.2 or Kimi 2.6 cloud via
+Ollama/OpenRouter). The shipped config deliberately ships `"model":
+"SET-ME"`: users must choose their own arbiter. Until they do, stalemates
+escalate to the owner, and `foreman.sh start` prints a notice.
+
 ## Lifecycle CLI
 
 ```
@@ -145,6 +201,7 @@ foreman.sh spawn worker <n>   # create .foreman/worktrees/worker-<n> + launch a 
 foreman.sh stop               # SIGTERM all PIDs in .foreman/pids/ (worktrees are left intact)
 foreman.sh status             # liveness of each crew member (PID check) + last log line
 foreman.sh logs <role> [-f]   # print/follow a crew member's log
+foreman.sh traffic [-f]       # pretty-print (or follow) the traffic ledger
 foreman.sh clean              # remove worktrees (refuses if a worktree has uncommitted changes) + prune
 ```
 
@@ -161,12 +218,6 @@ only crew member with real relay MCP tools.
 
 ## Known Limitations
 
-- **Circuit Breaker visibility.** Relay delivers directed messages; a peer only
-  sees traffic addressed to it. The Circuit Breaker therefore cannot passively
-  observe all conversations. Crew members are instructed to CC it on
-  contentious exchanges, and the Orchestrator involves it when loops are
-  suspected. True passive monitoring needs a hub-level tap (upstream Relay
-  feature).
 - **Outbound ask wire format** is best-effort against Relay protocol v2 and has
   not been verified against a live hub from this repo. It is isolated in
   `RelayClient` for easy correction.

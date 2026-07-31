@@ -71,6 +71,54 @@ if project_cfg_path:
 print(merged.get("model", ""))
 '
 
+# Pretty-printer for the traffic ledger (.foreman/traffic.jsonl).
+PY_PRINT_TRAFFIC='
+import json, sys, time
+
+path = sys.argv[1]
+try:
+    f = open(path, encoding="utf-8")
+except OSError:
+    sys.exit("No traffic ledger at " + path + " (has the crew exchanged any messages?)")
+with f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        ts = time.strftime("%H:%M:%S", time.localtime(m.get("ts", 0)))
+        content = str(m.get("content", "")).replace("\n", " ")
+        if len(content) > 160:
+            content = content[:157] + "..."
+        print("%s  %-24s -> %-24s [%s] %s" % (
+            ts, m.get("from", "?"), m.get("to", "?"), m.get("kind", "?"), content))
+'
+
+# Reports "unset" if the circuit-breaker arbiter model is missing or SET-ME,
+# "ok" otherwise (project config layered over skill config).
+PY_CHECK_ARBITER='
+import json, sys
+
+def load(path):
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+skill = load(sys.argv[1])
+project = load(sys.argv[2] if len(sys.argv) > 2 else "")
+role = dict((skill.get("roles") or {}).get("circuit-breaker") or {})
+role.update((project.get("roles") or {}).get("circuit-breaker") or {})
+model = (role.get("arbiter") or {}).get("model", "")
+print("unset" if not model or model == "SET-ME" else "ok")
+'
+
 usage() {
   cat <<'USAGE'
 Foreman lifecycle CLI.
@@ -89,6 +137,10 @@ Usage:
                                     log. <role> may be e.g. "architect",
                                     "worker-2", or the full session name
                                     "foreman-worker-2".
+  foreman.sh traffic [-f]          Pretty-print the crew traffic ledger
+                                    (.foreman/traffic.jsonl) — the job
+                                    site's flight recorder. -f follows the
+                                    raw ledger.
   foreman.sh clean                 Remove worker worktrees with no
                                     uncommitted changes, prune git worktree
                                     metadata, and drop stale pid files.
@@ -184,6 +236,18 @@ cmd_start() {
     launch_detached "$name" "$logs_dir/$name.log" "$pids_dir/$name.pid" \
       python3 "$RUNNER" --role "$role" --project "$PROJECT"
   done
+
+  local project_cfg=""
+  [ -f "$PROJECT/.foreman/config.json" ] && project_cfg="$PROJECT/.foreman/config.json"
+  if [ "$(python3 -c "$PY_CHECK_ARBITER" "$SKILL_CONFIG" "$project_cfg")" = "unset" ]; then
+    echo ""
+    echo "NOTICE: the Circuit Breaker's arbiter model is not configured (model: SET-ME)."
+    echo "Binding loop rulings need a frontier-class model of your choosing — Claude Opus"
+    echo "4.8-level or better (e.g. GLM 5.2 or Kimi 2.6 cloud via Ollama/OpenRouter)."
+    echo "Set roles.circuit-breaker.arbiter in foreman.config.json. Until then, crew"
+    echo "stalemates escalate to you instead of being ruled on."
+    echo ""
+  fi
 
   local orch_model
   orch_model="$(resolve_model orchestrator)"
@@ -393,6 +457,25 @@ cmd_logs() {
   fi
 }
 
+cmd_traffic() {
+  local follow=false a
+  for a in "$@"; do
+    case "$a" in
+      -f) follow=true ;;
+      *) echo "Usage: foreman.sh traffic [-f]" >&2; exit 1 ;;
+    esac
+  done
+
+  PROJECT="$(pwd)"
+  local ledger="$PROJECT/.foreman/traffic.jsonl"
+
+  if [ "$follow" = true ]; then
+    [ -f "$ledger" ] || { echo "No traffic ledger at $ledger" >&2; exit 1; }
+    exec tail -f "$ledger"
+  fi
+  python3 -c "$PY_PRINT_TRAFFIC" "$ledger"
+}
+
 cmd_clean() {
   PROJECT="$(pwd)"
   local foreman_dir="$PROJECT/.foreman"
@@ -480,6 +563,9 @@ main() {
       ;;
     logs)
       cmd_logs "$@"
+      ;;
+    traffic)
+      cmd_traffic "$@"
       ;;
     clean)
       cmd_clean
