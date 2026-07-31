@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,8 +43,32 @@ HUB_WAIT_INTERVAL = 5              # poll interval while waiting for the hub to 
 CLI_SUBPROCESS_TIMEOUT = 15 * 60    # 15 minutes
 OPENAI_HTTP_TIMEOUT = 300           # 5 minutes
 STDERR_TAIL_BYTES = 2000
+TRAFFIC_CONTENT_CAP = 2000
+
+# Circuit breaker: sliding-window loop detection tuning (see architecture.md,
+# "Traffic Ledger and the Circuit Breaker").
+BREAKER_POLL_TIMEOUT_MS = 2_000
+LOOP_WINDOW_SECONDS = 15 * 60       # 900s
+LOOP_WINDOW_MAX = 20
+LOOP_TRIP_TOTAL = 6
+LOOP_TRIP_PER_SIDE = 3
+LOOP_SUPPRESS_RECHECK_MESSAGES = 4
+LOOP_ARBITRATION_AFTER_MESSAGES = 4
+EVIDENCE_FILE_CAP_BYTES = 16 * 1024
+EVIDENCE_REF_FILE_CAP_BYTES = 8 * 1024
+EVIDENCE_MAX_REF_FILES = 5
+ARBITER_SYSTEM_CONTEXT = (
+    "You are the arbiter of last resort for a Foreman software delivery crew. "
+    "Two AI agents have been stuck in a repetitive disagreement, were flagged by the "
+    "Circuit Breaker, and have failed to resolve it themselves. You will be given the "
+    "disputed transcript plus supporting project evidence. Pick the position with the "
+    "stronger justification and issue a short, final, binding ruling with brief "
+    "reasoning. Do not hedge, do not ask follow-up questions, and do not propose a "
+    "third option — commit to one of the two positions and say so plainly."
+)
 
 ASK_DIRECTIVE_RE = re.compile(r"^@ask\s+(\S+):\s*(.+)$", re.MULTILINE)
+PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8}")
 
 
 def log(name: str, message: str) -> None:
@@ -215,6 +240,45 @@ class RelayClient:
                 self.sock.settimeout(original_timeout)
             except OSError:
                 pass
+
+
+# --------------------------------------------------------------------------
+# Traffic ledger — flight recorder for post-mortems and the Circuit Breaker.
+# --------------------------------------------------------------------------
+
+class TrafficLedger:
+    """Appends one JSON line per message to `<project>/.foreman/traffic.jsonl`.
+
+    Writes are a single `os.open(O_APPEND|O_CREAT|O_WRONLY)` + `os.write`,
+    atomic for small lines with no locking needed. Best-effort: every failure
+    is logged and swallowed — a broken ledger must never crash the runner.
+    """
+
+    def __init__(self, project_path: Path, name: str):
+        self.name = name
+        self.path = project_path / ".foreman" / "traffic.jsonl"
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log(name, f"traffic ledger: could not create {self.path.parent}: {e}")
+
+    def record(self, sender: str, to: str, kind: str, content: str) -> None:
+        try:
+            line = json.dumps({
+                "ts": time.time(),
+                "from": sender,
+                "to": to,
+                "kind": kind,
+                "content": (content or "")[:TRAFFIC_CONTENT_CAP],
+            }) + "\n"
+            data = line.encode("utf-8")
+            fd = os.open(str(self.path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+        except Exception as e:  # noqa: BLE001 — ledger writes must never crash the runner
+            log(self.name, f"traffic ledger write failed: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -513,20 +577,41 @@ class OpenAICompatibleBackend(Backend):
         return content
 
 
-def make_backend(role: str, resolved_cfg: Dict[str, Any], cwd: str, system_context: str, name: str) -> Backend:
+def make_backend(
+    role: str,
+    resolved_cfg: Dict[str, Any],
+    cwd: str,
+    system_context: str,
+    name: str,
+    strict: bool = True,
+) -> Backend:
+    """Build a Backend from a resolved role config.
+
+    strict=True (default, used for a crew member's own backend): a bad config
+    is fatal — sys.exit, matching prior behavior. strict=False (used for the
+    Circuit Breaker's arbiter, which must degrade to escalation rather than
+    take the breaker down): raises RuntimeError instead so the caller can
+    catch it and escalate.
+    """
+
+    def fail(msg: str) -> None:
+        if strict:
+            sys.exit(msg)
+        raise RuntimeError(msg)
+
     backend_name = resolved_cfg.get("backend")
     if not backend_name:
-        sys.exit(
+        fail(
             f"[{name}] Role '{role}' has no backend configured. "
             f"Check foreman.config.json and .foreman/config.json."
         )
     if backend_name == "claude-interactive":
-        sys.exit(
+        fail(
             f"[{name}] backend 'claude-interactive' is launched by foreman.sh for the "
             f"Orchestrator only — foreman-runner.py does not run it."
         )
     if not resolved_cfg.get("model"):
-        sys.exit(f"[{name}] Role '{role}' (backend '{backend_name}') has no model configured.")
+        fail(f"[{name}] Role '{role}' (backend '{backend_name}') has no model configured.")
 
     if backend_name == "claude-cli":
         return ClaudeCliBackend(resolved_cfg, cwd, system_context, name)
@@ -534,17 +619,20 @@ def make_backend(role: str, resolved_cfg: Dict[str, Any], cwd: str, system_conte
         return CodexCliBackend(resolved_cfg, cwd, system_context, name)
     if backend_name == "openai-compatible":
         if not resolved_cfg.get("base_url"):
-            sys.exit(f"[{name}] Role '{role}' backend 'openai-compatible' has no base_url configured.")
+            fail(f"[{name}] Role '{role}' backend 'openai-compatible' has no base_url configured.")
         return OpenAICompatibleBackend(resolved_cfg, cwd, system_context, name)
 
-    sys.exit(f"[{name}] Unknown backend '{backend_name}' for role '{role}'.")
+    fail(f"[{name}] Unknown backend '{backend_name}' for role '{role}'.")
+    raise AssertionError("unreachable")  # fail() always raises/exits
 
 
 # --------------------------------------------------------------------------
 # @ask directive loop + main message loop
 # --------------------------------------------------------------------------
 
-def run_ask_loop(client: RelayClient, backend: Backend, message: str, name: str) -> str:
+def run_ask_loop(
+    client: RelayClient, backend: Backend, message: str, name: str, ledger: TrafficLedger
+) -> str:
     """Run backend.respond, resolving @ask directives against peers until the
     response is directive-free or MAX_ASK_HOPS is reached."""
     response = backend.respond(message)
@@ -560,7 +648,14 @@ def run_ask_loop(client: RelayClient, backend: Backend, message: str, name: str)
             peer = peer.strip()
             question = question.strip()
             log(name, f"@ask -> {peer}: {question[:120]}")
+            # Ledger rule: an outbound ask is only logged when addressed to
+            # foreman-orchestrator (the one peer with no runner of its own to
+            # log the other end) — see architecture.md.
+            if peer == "foreman-orchestrator":
+                ledger.record(name, peer, "ask", question)
             answer = client.ask(peer, question)
+            if peer == "foreman-orchestrator":
+                ledger.record(peer, name, "reply", answer)
             answers.append(f"- {peer}: {answer}")
 
         followup = "Answers to your asks:\n" + "\n".join(answers)
@@ -571,7 +666,7 @@ def run_ask_loop(client: RelayClient, backend: Backend, message: str, name: str)
     return response
 
 
-def message_loop(client: RelayClient, backend: Backend, name: str) -> None:
+def message_loop(client: RelayClient, backend: Backend, name: str, ledger: TrafficLedger) -> None:
     """Runs until the hub connection drops (raises ConnectionError)."""
     while True:
         msg = client.inbox_wait(timeout_ms=INBOX_WAIT_TIMEOUT_MS)
@@ -602,22 +697,431 @@ def message_loop(client: RelayClient, backend: Backend, name: str) -> None:
             continue
 
         log(name, f"message from {from_peer}: {content[:120]}")
-        final_text = run_ask_loop(client, backend, content, name)
+        # Ledger rule: every inbound delivery is logged by the receiver's own
+        # runner (the sender's runner does not log it) — see architecture.md.
+        ledger.record(from_peer, name, "ask", content)
+        final_text = run_ask_loop(client, backend, content, name, ledger)
 
         if ask_id:
             client.reply(ask_id, final_text)
+            ledger.record(name, from_peer, "reply", final_text)
             log(name, f"replied to {from_peer}")
         else:
             log(name, "no ask_id on delivery; nothing to reply to")
 
 
-def announce_readiness(client: RelayClient, name: str, role: str) -> None:
-    result = client.ask(
-        "foreman-orchestrator",
-        f"{name} ({role}) is online and ready.",
-        timeout_ms=READINESS_ASK_TIMEOUT_MS,
-    )
+def announce_readiness(client: RelayClient, name: str, role: str, ledger: TrafficLedger) -> None:
+    question = f"{name} ({role}) is online and ready."
+    ledger.record(name, "foreman-orchestrator", "ask", question)
+    result = client.ask("foreman-orchestrator", question, timeout_ms=READINESS_ASK_TIMEOUT_MS)
+    ledger.record("foreman-orchestrator", name, "reply", result)
     log(name, f"readiness announcement to foreman-orchestrator: {result}")
+
+
+# --------------------------------------------------------------------------
+# Circuit Breaker: mechanical detection, LLM judgment.
+#
+# The breaker does not run the generic message_loop. It tails the traffic
+# ledger, detects loops with pure code (sliding 15-minute window per agent
+# pair), and only calls a model at the moment of judgment (confirm a trip,
+# or arbitrate past the flag). See architecture.md, "Traffic Ledger and the
+# Circuit Breaker".
+# --------------------------------------------------------------------------
+
+class PairState:
+    """Sliding-window state for one unordered agent pair."""
+
+    def __init__(self) -> None:
+        self.window: "deque[Tuple[float, str, str]]" = deque()  # (ts, from, content)
+        self.status: str = "WATCHING"          # WATCHING | FLAGGED | RESOLVED
+        self.suppress_until_count: Optional[int] = None
+        self.flag_at_count: Optional[int] = None
+
+
+class LoopDetector:
+    """Pure-code loop detection over the traffic ledger, with LLM judgment
+    calls only at trip (confirm) and past-flag (arbitrate) moments.
+
+    Takes the relay client and both backends as injected collaborators so it
+    is testable without a live hub or real models.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        ledger: TrafficLedger,
+        confirm_backend: Backend,
+        resolved_cfg: Dict[str, Any],
+        cwd: str,
+        project_path: Path,
+    ) -> None:
+        self.name = name
+        self.ledger = ledger
+        self.confirm_backend = confirm_backend
+        self.resolved_cfg = resolved_cfg
+        self.cwd = cwd
+        self.project_path = project_path
+
+        self.ledger_path = ledger.path
+        self.offset = 0
+        self.pairs: Dict[Tuple[str, str], PairState] = {}
+
+        self.total_messages = 0
+        self.flags_count = 0
+        self.rulings_count = 0  # forced rulings + escalations
+
+    # -- status ------------------------------------------------------------
+
+    def status_summary(self) -> str:
+        active = sum(1 for s in self.pairs.values() if s.window)
+        return (
+            f"Circuit Breaker: monitoring — {self.total_messages} ledger messages, "
+            f"{active} active pairs, {self.flags_count} flags, "
+            f"{self.rulings_count} rulings/escalations this job."
+        )
+
+    # -- ledger ingestion ----------------------------------------------------
+
+    def ingest_new_lines(self) -> None:
+        if not self.ledger_path.exists():
+            return
+        try:
+            with self.ledger_path.open("rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError as e:
+            log(self.name, f"traffic ledger read failed: {e}")
+            return
+        if not data:
+            return
+
+        # Only consume complete lines; a trailing partial line (the ledger
+        # writer mid-write) is left for the next poll.
+        last_nl = data.rfind(b"\n")
+        if last_nl == -1:
+            return
+        complete, self.offset = data[: last_nl + 1], self.offset + last_nl + 1
+
+        for raw in complete.split(b"\n"):
+            if not raw.strip():
+                continue
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                log(self.name, f"skipping malformed ledger line: {e}")
+                continue
+            self.total_messages += 1
+            self._observe(entry)
+
+    def _observe(self, entry: Dict[str, Any]) -> None:
+        frm, to = entry.get("from"), entry.get("to")
+        if not frm or not to:
+            return
+        # The breaker is a party to its own status replies and readiness
+        # traffic — excluded from detection since neither side of a loop can
+        # be the breaker itself.
+        if frm == self.name or to == self.name:
+            return
+        content = entry.get("content", "") or ""
+        ts = entry.get("ts", time.time())
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            ts = time.time()
+
+        key = tuple(sorted((frm, to)))
+        state = self.pairs.setdefault(key, PairState())
+        state.window.append((ts, frm, content))
+
+    # -- aging + dispatch ----------------------------------------------------
+
+    def poll(self, client: RelayClient) -> None:
+        self.ingest_new_lines()
+        for key, state in list(self.pairs.items()):
+            self._age(state)
+            if not state.window and state.status != "WATCHING":
+                # Window emptied naturally — the dispute is over (RESOLVED, or
+                # a flag that worked). Reset so a later, healthy exchange
+                # between the same pair starts from scratch instead of walking
+                # straight into arbitration on a stale flag.
+                state.status = "WATCHING"
+                state.flag_at_count = None
+                state.suppress_until_count = None
+            try:
+                self._process_pair(client, key, state)
+            except Exception as e:  # noqa: BLE001 — one bad pair must not kill the breaker
+                log(self.name, f"loop detector error on pair {key} (continuing): {e}")
+
+    @staticmethod
+    def _age(state: PairState) -> None:
+        cutoff = time.time() - LOOP_WINDOW_SECONDS
+        while state.window and state.window[0][0] < cutoff:
+            state.window.popleft()
+        while len(state.window) > LOOP_WINDOW_MAX:
+            state.window.popleft()
+
+    def _process_pair(self, client: RelayClient, key: Tuple[str, str], state: PairState) -> None:
+        a, b = key
+        if state.status == "WATCHING":
+            total = len(state.window)
+            if state.suppress_until_count is not None:
+                if total < state.suppress_until_count:
+                    return
+                state.suppress_until_count = None
+            count_a = sum(1 for _, frm, _ in state.window if frm == a)
+            count_b = sum(1 for _, frm, _ in state.window if frm == b)
+            if total >= LOOP_TRIP_TOTAL and count_a >= LOOP_TRIP_PER_SIDE and count_b >= LOOP_TRIP_PER_SIDE:
+                self._confirm(client, key, state)
+        elif state.status == "FLAGGED":
+            since_flag = len(state.window) - (state.flag_at_count or 0)
+            if since_flag >= LOOP_ARBITRATION_AFTER_MESSAGES:
+                self._arbitrate(client, key, state)
+        # RESOLVED: nothing to do until poll()'s aging pass empties the window.
+
+    # -- transcript helpers ---------------------------------------------------
+
+    @staticmethod
+    def _format_transcript(window: "deque[Tuple[float, str, str]]") -> str:
+        return "\n".join(f"[{frm}] {content}" for _, frm, content in window)
+
+    @staticmethod
+    def _extract_positions(confirm_output: str) -> str:
+        m = re.search(r"POSITIONS:\s*(.+)", confirm_output, re.IGNORECASE | re.DOTALL)
+        if m:
+            return f"Positions — {m.group(1).strip()[:500]}"
+        return "Both agents appear to be repeating their positions without new information."
+
+    # -- trip -> confirm ------------------------------------------------------
+
+    def _confirm(self, client: RelayClient, key: Tuple[str, str], state: PairState) -> None:
+        a, b = key
+        transcript = self._format_transcript(state.window)
+        prompt = (
+            f"Transcript between {a} and {b}:\n\n{transcript}\n\n"
+            "Are these two agents stuck in a repetitive loop (repeating the same "
+            "disagreement without progress)? First line: LOOP: YES or LOOP: NO. "
+            "If YES, then POSITIONS: <one-sentence summary of each side>."
+        )
+        try:
+            result = self.confirm_backend.respond(prompt) or ""
+        except Exception as e:  # noqa: BLE001 — judgment failures must not crash the breaker
+            log(self.name, f"confirm backend call failed for pair {key}: {e}")
+            result = ""
+
+        if re.search(r"LOOP:\s*YES", result, re.IGNORECASE):
+            self._flag(client, key, state, result)
+        else:
+            # NO, or unparseable — suppress until 4 more messages accumulate.
+            state.suppress_until_count = len(state.window) + LOOP_SUPPRESS_RECHECK_MESSAGES
+
+    def _flag(self, client: RelayClient, key: Tuple[str, str], state: PairState, confirm_output: str) -> None:
+        a, b = key
+        positions = self._extract_positions(confirm_output)
+        flag_text = (
+            f"Circuit Breaker: a loop has been detected between {a} and {b}. "
+            f"{positions} Resolve this directly in your next exchange, or a "
+            f"binding resolution will be forced."
+        )
+        for agent in (a, b):
+            self.ledger.record(self.name, agent, "ask", flag_text)
+            answer = client.ask(agent, flag_text)
+            self.ledger.record(agent, self.name, "reply", answer)
+
+        state.status = "FLAGGED"
+        state.flag_at_count = len(state.window)
+        self.flags_count += 1
+
+    # -- flag -> arbitrate ------------------------------------------------------
+
+    def _arbitrate(self, client: RelayClient, key: Tuple[str, str], state: PairState) -> None:
+        a, b = key
+        transcript = self._format_transcript(state.window)
+
+        if "foreman-orchestrator" in (a, b):
+            msg = (
+                f"CIRCUIT BREAKER ESCALATION: loop between {a} and {b} persists past the "
+                f"flag; per protocol the owner must decide.\n\nTranscript:\n{transcript}"
+            )
+            self._escalate(client, msg)
+            state.status = "RESOLVED"
+            self.rulings_count += 1
+            return
+
+        arbiter_backend, unavailable_reason = self._build_arbiter_backend()
+        if arbiter_backend is None:
+            msg = (
+                f"CIRCUIT BREAKER ESCALATION: loop between {a} and {b} persists past the "
+                f"flag, and {unavailable_reason}; per protocol the owner must decide.\n\n"
+                f"Transcript:\n{transcript}"
+            )
+            self._escalate(client, msg)
+            state.status = "RESOLVED"
+            self.rulings_count += 1
+            return
+
+        evidence = self._build_evidence_packet(a, b, transcript)
+        arb_prompt = (
+            f"{evidence}\n\nPick the position with the stronger justification and issue "
+            f"a final, binding ruling with brief reasoning."
+        )
+        try:
+            ruling = arbiter_backend.respond(arb_prompt) or ""
+        except Exception as e:  # noqa: BLE001
+            ruling = f"[arbiter exception: {e}]"
+
+        if not ruling.strip() or ruling.lstrip().startswith("["):
+            msg = (
+                f"CIRCUIT BREAKER ESCALATION: loop between {a} and {b} persists past the "
+                f"flag, and the arbiter failed to produce a ruling ({ruling[:300]}); per "
+                f"protocol the owner must decide.\n\nTranscript:\n{transcript}"
+            )
+            self._escalate(client, msg)
+            state.status = "RESOLVED"
+            self.rulings_count += 1
+            return
+
+        ruling_text = "CIRCUIT BREAKER FORCED RESOLUTION (binding): " + ruling
+        for agent in (a, b):
+            self.ledger.record(self.name, agent, "ask", ruling_text)
+            answer = client.ask(agent, ruling_text)
+            self.ledger.record(agent, self.name, "reply", answer)
+
+        notify = f"Circuit Breaker forced resolution between {a} and {b}: {ruling[:800]}"
+        self.ledger.record(self.name, "foreman-orchestrator", "ask", notify)
+        ans = client.ask("foreman-orchestrator", notify)
+        self.ledger.record("foreman-orchestrator", self.name, "reply", ans)
+
+        state.status = "RESOLVED"
+        self.rulings_count += 1
+
+    def _escalate(self, client: RelayClient, message: str) -> None:
+        self.ledger.record(self.name, "foreman-orchestrator", "ask", message)
+        answer = client.ask("foreman-orchestrator", message)
+        self.ledger.record("foreman-orchestrator", self.name, "reply", answer)
+
+    def _build_arbiter_backend(self) -> Tuple[Optional[Backend], Optional[str]]:
+        """Build the arbiter backend from the role's `arbiter` sub-config.
+        Defaults do NOT apply — it stands alone. Never raises: returns
+        (None, reason) on any misconfiguration or construction failure so the
+        caller can degrade to escalation."""
+        arbiter_cfg = self.resolved_cfg.get("arbiter")
+        if not arbiter_cfg or not isinstance(arbiter_cfg, dict):
+            return None, "the arbiter is not configured"
+
+        arbiter_cfg = _strip_comments(arbiter_cfg)
+        model = arbiter_cfg.get("model")
+        if not model or model == "SET-ME":
+            return None, "the arbiter model is not set (still SET-ME)"
+
+        try:
+            backend = make_backend(
+                "circuit-breaker-arbiter",
+                arbiter_cfg,
+                self.cwd,
+                ARBITER_SYSTEM_CONTEXT,
+                self.name,
+                strict=False,
+            )
+        except Exception as e:  # noqa: BLE001 — arbiter misconfiguration must degrade, not crash
+            return None, f"the arbiter could not be constructed ({e})"
+        return backend, None
+
+    def _build_evidence_packet(self, a: str, b: str, transcript: str) -> str:
+        parts = [f"Transcript between {a} and {b}:\n{transcript}"]
+        for fname in ("CURRENT_PLAN.md", "DECISIONS.md"):
+            fpath = self.project_path / fname
+            if fpath.is_file():
+                try:
+                    text = fpath.read_text(encoding="utf-8", errors="replace")[:EVIDENCE_FILE_CAP_BYTES]
+                    parts.append(f"--- {fname} ---\n{text}")
+                except OSError as e:
+                    log(self.name, f"could not read {fname} for evidence packet: {e}")
+        for ref in self._referenced_files(transcript):
+            try:
+                text = ref.read_text(encoding="utf-8", errors="replace")[:EVIDENCE_REF_FILE_CAP_BYTES]
+                try:
+                    label = str(ref.relative_to(self.project_path))
+                except ValueError:
+                    label = str(ref)
+                parts.append(f"--- {label} ---\n{text}")
+            except OSError as e:
+                log(self.name, f"could not read referenced file {ref} for evidence packet: {e}")
+        return "\n\n".join(parts)
+
+    def _referenced_files(self, transcript: str) -> List[Path]:
+        """Path-like tokens with an extension, resolved under the project
+        directory only — anything resolving outside it is rejected. Up to
+        EVIDENCE_MAX_REF_FILES existing files."""
+        project_root = self.project_path.resolve()
+        found: List[Path] = []
+        seen = set()
+        for token in PATH_TOKEN_RE.findall(transcript):
+            token = token.strip(".,:;()[]{}\"'")
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            try:
+                candidate = (project_root / token).resolve()
+                candidate.relative_to(project_root)  # raises if it escapes the project dir
+            except (OSError, ValueError):
+                continue
+            if candidate.is_file():
+                found.append(candidate)
+            if len(found) >= EVIDENCE_MAX_REF_FILES:
+                break
+        return found
+
+
+def breaker_loop(
+    client: RelayClient,
+    confirm_backend: Backend,
+    name: str,
+    resolved_cfg: Dict[str, Any],
+    cwd: str,
+    project_path: Path,
+    ledger: TrafficLedger,
+) -> None:
+    """Circuit Breaker's loop, run instead of message_loop. Answers status
+    asks mechanically (no LLM); otherwise tails the ledger and runs the loop
+    detector. Runs until the hub connection drops (raises ConnectionError)."""
+    detector = LoopDetector(name, ledger, confirm_backend, resolved_cfg, cwd, project_path)
+
+    while True:
+        msg = client.inbox_wait(timeout_ms=BREAKER_POLL_TIMEOUT_MS)
+        msg_type = msg.get("type")
+
+        if msg_type == "inbox_deliver":
+            err_code = msg.get("err_code")
+            if err_code:
+                log(name, f"err_code notification: {err_code}")
+                continue
+
+            from_peer = msg.get("from", "unknown")
+            content = (msg.get("content") or "").strip()
+            ask_id = msg.get("ask_id")
+            if content:
+                ledger.record(from_peer, name, "ask", content)
+
+            if ask_id:
+                status = detector.status_summary()
+                client.reply(ask_id, status)
+                ledger.record(name, from_peer, "reply", status)
+                log(name, f"status reply to {from_peer}: {status}")
+            continue
+
+        if msg_type == "err":
+            log(name, f"err notification: {msg.get('code')}")
+            continue
+
+        if msg_type != "inbox_timeout":
+            log(name, f"unexpected message type from hub: {msg_type}")
+            continue
+
+        # inbox_timeout: no message waiting — process the ledger.
+        try:
+            detector.poll(client)
+        except Exception as e:  # noqa: BLE001 — the breaker must survive a bad detector cycle
+            log(name, f"breaker detector cycle failed (continuing): {e}")
 
 
 # --------------------------------------------------------------------------
@@ -660,6 +1164,7 @@ def main() -> None:
     system_context = build_system_context(skill_root, role, name)
     backend = make_backend(role, resolved_cfg, cwd, system_context, name)
 
+    ledger = TrafficLedger(project_path, name)
     client = RelayClient(name, cwd)
 
     def handle_sigterm(signum: int, frame: Any) -> None:
@@ -680,9 +1185,12 @@ def main() -> None:
                 consecutive_failures = 0
                 backoff = RECONNECT_BACKOFF_MIN
 
-                announce_readiness(client, name, role)
+                announce_readiness(client, name, role, ledger)
                 log(name, f"ready. role={role} backend={resolved_cfg.get('backend')} model={resolved_cfg.get('model')}")
-                message_loop(client, backend, name)
+                if role == "circuit-breaker":
+                    breaker_loop(client, backend, name, resolved_cfg, cwd, project_path, ledger)
+                else:
+                    message_loop(client, backend, name, ledger)
             except FileNotFoundError as e:
                 if not ever_connected:
                     # Startup phase: foreman.sh launches runners before the

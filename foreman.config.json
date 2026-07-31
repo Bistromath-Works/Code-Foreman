@@ -11,7 +11,11 @@
     "worker":          { "backend": "claude-cli", "model": "sonnet" },
     "cleaner":         { "backend": "claude-cli", "model": "haiku" },
     "circuit-breaker": { "backend": "claude-cli", "model": "haiku",
-                         "allowed_tools": [] },
+                         "allowed_tools": [],
+                         "arbiter": { "//": "Binding loop rulings need a frontier-class model — Claude Opus 4.8-level or better (e.g. GLM 5.2 or Kimi 2.6 cloud via Ollama/OpenRouter). Replace SET-ME; until then stalemates escalate to the owner.",
+                                      "backend": "openai-compatible",
+                                      "base_url": "http://127.0.0.1:11434/v1",
+                                      "model": "SET-ME", "api_key_env": "" } },
     "muse":            { "backend": "claude-cli", "model": "haiku",
                          "allowed_tools": [] }
   }
