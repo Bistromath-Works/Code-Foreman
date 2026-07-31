@@ -14,6 +14,7 @@
 #   foreman.sh status
 #   foreman.sh logs <role-or-session-name> [-f]
 #   foreman.sh clean
+#   foreman.sh merge [--abort | --skip <n> | <n> ...]
 #   foreman.sh help
 #
 # Compatible with macOS bash 3.2: no associative arrays, no ${var@Q}.
@@ -144,6 +145,15 @@ Usage:
   foreman.sh clean                 Remove worker worktrees with no
                                     uncommitted changes, prune git worktree
                                     metadata, and drop stale pid files.
+  foreman.sh merge [<n> ...]       Merge worker branches (default: all
+                                    discovered workers) into
+                                    foreman-integration, sequentially.
+  foreman.sh merge --abort         Restore the pre-merge branch;
+                                    foreman-integration is kept for
+                                    inspection.
+  foreman.sh merge --skip <n>      Clear a merge block recorded against
+                                    worker <n> without merging it — the
+                                    worker must be handled manually.
   foreman.sh help                  Show this message.
 
 Core crew (spawned by 'start'): architect, dissenter, inspector, cleaner,
@@ -323,6 +333,9 @@ cmd_spawn_worker() {
     branch="foreman-worker-$n-$(date +%s)-$$"
     git -C "$PROJECT" worktree add -b "$branch" "$worktree_path" HEAD
     echo "Worker worktree created: $worktree_path (branch: $branch)"
+    # Branch name must survive worktree removal — `merge` reads it from here.
+    # See architecture.md "Integration: the merge workflow", rule 1.
+    printf '%s\n' "$branch" > "$worktrees_dir/worker-$n.branch"
   else
     echo "Warning: not a git repo — Worker $n will share the main project directory." >&2
     worktree_path="$PROJECT"
@@ -532,6 +545,398 @@ cmd_clean() {
   return 0
 }
 
+# --- merge --------------------------------------------------------------------
+#
+# Implements references/architecture.md, "Integration: the merge workflow".
+# Every check here exists because an adversarial review found a concrete
+# failure mode (see the numbered rules in that section) — do not simplify.
+
+# Guard: refuse unless cwd is the main project root, not a worker worktree.
+merge_validate_cwd() {
+  case "$(pwd)" in
+    */.foreman/worktrees/*)
+      echo "Error: 'foreman.sh merge' must be run from the main project root, not from inside a worker worktree." >&2
+      exit 1
+      ;;
+  esac
+
+  local toplevel here
+  if ! toplevel="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "Error: not inside a git repository." >&2
+    exit 1
+  fi
+  here="$(pwd -P)"
+  if [ "$toplevel" != "$here" ]; then
+    echo "Error: 'foreman.sh merge' must be run from the main project root ($toplevel), not from $here." >&2
+    exit 1
+  fi
+}
+
+# Guard: mkdir-based lock so concurrent invocations fail fast instead of
+# corrupting the index. Removed on exit via trap (covers success, error exit,
+# and the hard `exit 1` calls sprinkled through the merge helpers below).
+merge_acquire_lock() {
+  local lockdir="$1"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    local holder=""
+    [ -f "$lockdir/holder" ] && holder="$(cat "$lockdir/holder" 2>/dev/null || true)"
+    echo "Error: another 'foreman.sh merge' is already in progress (lock: $lockdir)." >&2
+    if [ -n "$holder" ]; then
+      echo "  held by: $holder" >&2
+    fi
+    exit 1
+  fi
+  printf 'pid %s on host %s at %s\n' "$$" "$(hostname 2>/dev/null || echo unknown)" "$(date)" \
+    > "$lockdir/holder" 2>/dev/null || true
+  # MERGE_LOCKDIR is intentionally script-global (not local): the EXIT trap
+  # fires after this function's own locals have gone out of scope.
+  MERGE_LOCKDIR="$lockdir"
+  trap 'rm -rf "$MERGE_LOCKDIR"' EXIT
+}
+
+# Resolves the set of worker numbers to operate on: explicit args if given,
+# else every worker discoverable from .branch state files or live worktree
+# dirs. Prints space-separated ascending unique numbers.
+merge_resolve_worker_set() {
+  local foreman_dir="$1" explicit="$2"
+  local nums=""
+
+  if [ -n "$(printf '%s' "$explicit" | tr -d '[:space:]')" ]; then
+    nums="$explicit"
+  else
+    local f d base num
+    for f in "$foreman_dir"/worktrees/worker-*.branch; do
+      [ -e "$f" ] || continue
+      base="$(basename "$f" .branch)"
+      num="${base#worker-}"
+      nums="$nums $num"
+    done
+    for d in "$foreman_dir"/worktrees/worker-*/; do
+      [ -e "$d" ] || continue
+      d="${d%/}"
+      base="$(basename "$d")"
+      num="${base#worker-}"
+      nums="$nums $num"
+    done
+  fi
+
+  printf '%s\n' "$nums" | tr ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# Resolves worker <n>'s branch name: the .branch state file first (survives
+# worktree removal), falling back to the live worktree's checked-out branch.
+merge_resolve_branch_for_worker() {
+  local foreman_dir="$1" n="$2"
+  local branch_file="$foreman_dir/worktrees/worker-$n.branch"
+  local worktree_dir="$foreman_dir/worktrees/worker-$n"
+  local branch=""
+
+  if [ -f "$branch_file" ]; then
+    branch="$(sed -n '1p' "$branch_file" | tr -d '\r\n')"
+  fi
+  if [ -z "$branch" ] && [ -d "$worktree_dir" ]; then
+    branch="$(git -C "$worktree_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  fi
+  if [ -z "$branch" ]; then
+    echo "Error: cannot resolve a branch name for worker $n (no $branch_file and no live worktree at $worktree_dir)." >&2
+    exit 1
+  fi
+  printf '%s\n' "$branch"
+}
+
+# Merges worker <n>'s branch into the currently-checked-out foreman-integration.
+# Sets MERGE_WORKER_RESULT to "merged" or "skipped" on success; exits the
+# script directly on any hard failure (rules 1, 4, 5, 6).
+merge_one_worker() {
+  local foreman_dir="$1" n="$2"
+  local worktree_dir="$foreman_dir/worktrees/worker-$n"
+  MERGE_WORKER_RESULT=""
+
+  local branch
+  branch="$(merge_resolve_branch_for_worker "$foreman_dir" "$n")"
+
+  # Rule 1: hard error (not warn-and-continue) on a name that doesn't match
+  # the expected foreman-worker-<n>-* pattern.
+  case "$branch" in
+    foreman-worker-"$n"-*) ;;
+    *)
+      echo "Error: worker $n's branch '$branch' does not match the expected pattern 'foreman-worker-$n-*'." >&2
+      exit 1
+      ;;
+  esac
+
+  if ! git rev-parse --verify -q "$branch" >/dev/null 2>&1; then
+    echo "Error: worker $n's branch '$branch' does not exist." >&2
+    exit 1
+  fi
+
+  # Rule 4: committed work only.
+  if [ -d "$worktree_dir" ]; then
+    local wstatus
+    wstatus="$(git -C "$worktree_dir" status --porcelain 2>&1 || true)"
+    if [ -n "$wstatus" ]; then
+      echo "Error: worker $n has uncommitted changes — it must commit before merging." >&2
+      printf '%s\n' "$wstatus" | sed 's/^/    /' >&2
+      exit 1
+    fi
+  fi
+
+  local ahead
+  ahead="$(git rev-list --count foreman-integration.."$branch")"
+  if [ "$ahead" = "0" ]; then
+    echo "WARNING: worker $n: 0 commits since fork — possible failed worker. Skipping (nothing to merge)." >&2
+    MERGE_WORKER_RESULT="skipped"
+    return 0
+  fi
+
+  echo "Merging worker $n ($branch)..."
+  local merge_out
+  if merge_out="$(git merge --no-ff "$branch" -m "merge: worker $n ($branch)" 2>&1)"; then
+    printf '%s\n' "$merge_out"
+    echo "Worker $n merged cleanly."
+    MERGE_WORKER_RESULT="merged"
+    return 0
+  fi
+
+  # Rule 5 vs rule 6: unmerged paths means a real content conflict; an empty
+  # `git ls-files -u` with a nonzero exit means the merge itself failed for
+  # some other reason (hook, tooling) and must not be reported as a conflict.
+  local unmerged
+  unmerged="$(git ls-files -u)"
+  if [ -n "$unmerged" ]; then
+    local files blocked_sha
+    files="$(git diff --name-only --diff-filter=U | sort -u)"
+    blocked_sha="$(git rev-parse HEAD)"
+    git merge --abort >/dev/null 2>&1 || true
+    {
+      echo "$n"
+      echo "$blocked_sha"
+    } > "$foreman_dir/merge-blocked"
+
+    {
+      echo ""
+      echo "CONFLICT: worker $n ($branch) could not be merged cleanly."
+      echo "Conflicted files:"
+      printf '%s\n' "$files" | sed 's/^/    /'
+      echo ""
+      echo "foreman-integration is blocked at $blocked_sha."
+      echo "Recovery: worker $n merges foreman-integration into its own worktree (the one"
+      echo "sanctioned exception to \"workers never merge\"), resolves against $blocked_sha,"
+      echo "commits, and reports back. Then rerun: foreman.sh merge $n"
+    } >&2
+    exit 1
+  else
+    {
+      echo ""
+      echo "ERROR: merge of worker $n ($branch) failed with no conflicted files — this is a"
+      echo "hook or tooling failure, not a content conflict. git output:"
+      printf '%s\n' "$merge_out" | sed 's/^/    /'
+    } >&2
+    if git rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1; then
+      git merge --abort >/dev/null 2>&1 || true
+    fi
+    exit 1
+  fi
+}
+
+# Normal run: merges the requested (or discovered) worker set into
+# foreman-integration, sequentially in ascending order.
+merge_do_run() {
+  local foreman_dir="$1" explicit_workers="$2"
+
+  # Rule 2: no detached HEAD, unless we're effectively already on
+  # foreman-integration (its tip commit is checked out).
+  local current_branch=""
+  if git symbolic-ref -q HEAD >/dev/null 2>&1; then
+    current_branch="$(git symbolic-ref --short HEAD)"
+  elif git rev-parse --verify -q refs/heads/foreman-integration >/dev/null 2>&1 \
+      && [ "$(git rev-parse HEAD)" = "$(git rev-parse foreman-integration)" ]; then
+    current_branch="foreman-integration"
+  else
+    echo "Error: 'foreman.sh merge' cannot run on a detached HEAD. Check out a branch and retry." >&2
+    exit 1
+  fi
+
+  # Rule 2: main tree must be clean.
+  local dirty
+  dirty="$(git status --porcelain)"
+  if [ -n "$dirty" ]; then
+    echo "Error: the main working tree is not clean. Commit or stash changes before merging." >&2
+    printf '%s\n' "$dirty" | sed 's/^/    /' >&2
+    exit 1
+  fi
+
+  local requested_workers
+  requested_workers="$(merge_resolve_worker_set "$foreman_dir" "$explicit_workers")"
+  if [ -z "$requested_workers" ]; then
+    echo "Error: no workers found (no .foreman/worktrees/worker-*.branch files and no live worktrees)." >&2
+    exit 1
+  fi
+
+  # Rule 5: the conflict gate. Any run must match the blocked worker exactly.
+  local blocked_file="$foreman_dir/merge-blocked"
+  if [ -f "$blocked_file" ]; then
+    local blocked_n blocked_sha
+    blocked_n="$(sed -n '1p' "$blocked_file")"
+    blocked_sha="$(sed -n '2p' "$blocked_file")"
+    if [ "$requested_workers" != "$blocked_n" ]; then
+      echo "Error: merge is blocked on worker $blocked_n (foreman-integration was at $blocked_sha)." >&2
+      echo "Resolve worker $blocked_n first (rerun 'foreman.sh merge $blocked_n' once it has merged" >&2
+      echo "foreman-integration into its own worktree and resolved), or run 'foreman.sh merge --skip $blocked_n'." >&2
+      exit 1
+    fi
+  fi
+
+  # Rule 3: first run creates foreman-integration; later runs require it.
+  if ! git rev-parse --verify -q refs/heads/foreman-integration >/dev/null 2>&1; then
+    printf '%s\n' "$current_branch" > "$foreman_dir/pre-merge-branch"
+    git checkout -b foreman-integration
+    echo "Recorded pre-merge branch: $current_branch"
+    echo "Created and checked out foreman-integration."
+  elif [ "$current_branch" != "foreman-integration" ]; then
+    echo "Error: foreman-integration already exists but is not checked out (currently on '$current_branch')." >&2
+    echo "Run 'git checkout foreman-integration' to continue the merge, or 'foreman.sh merge --abort' to abandon it." >&2
+    exit 1
+  fi
+
+  local pre_merge_sha
+  pre_merge_sha="$(git rev-parse HEAD)"
+
+  local merged_list="" skipped_list="" n
+  for n in $requested_workers; do
+    merge_one_worker "$foreman_dir" "$n"
+    case "$MERGE_WORKER_RESULT" in
+      merged) merged_list="$merged_list $n" ;;
+      skipped) skipped_list="$skipped_list $n" ;;
+    esac
+  done
+
+  rm -f "$blocked_file"
+
+  echo ""
+  if [ -n "$merged_list" ]; then
+    echo "Merged workers:$merged_list"
+  fi
+  if [ -n "$skipped_list" ]; then
+    echo "Skipped (0 commits since fork):$skipped_list"
+  fi
+  echo ""
+  echo "Diff stat vs pre-merge ($pre_merge_sha):"
+  git diff --stat "$pre_merge_sha"..HEAD
+  echo ""
+  echo "foreman-integration is ready. Run the TypeScript review, Architect conformance"
+  echo "review, and Inspector audit against this tree."
+}
+
+# `merge --abort`: rule 8.
+merge_do_abort() {
+  local foreman_dir="$1"
+  local pre_branch_file="$foreman_dir/pre-merge-branch"
+
+  if [ ! -f "$pre_branch_file" ]; then
+    echo "Error: no merge in progress (no $pre_branch_file recorded)." >&2
+    exit 1
+  fi
+  local pre_branch
+  pre_branch="$(cat "$pre_branch_file")"
+
+  if git rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1; then
+    git merge --abort >/dev/null 2>&1 || true
+  fi
+
+  git checkout "$pre_branch"
+
+  rm -f "$foreman_dir/merge-blocked" "$pre_branch_file"
+
+  echo "Restored branch: $pre_branch"
+  echo "foreman-integration is left in place for inspection."
+  echo "Delete it when you are done with it: git branch -D foreman-integration"
+}
+
+# `merge --skip <n>`: only valid while worker <n> is the recorded block.
+merge_do_skip() {
+  local foreman_dir="$1" n="$2"
+  local blocked_file="$foreman_dir/merge-blocked"
+
+  if [ ! -f "$blocked_file" ]; then
+    echo "Error: no merge is currently blocked; nothing to skip." >&2
+    exit 1
+  fi
+  local blocked_n
+  blocked_n="$(sed -n '1p' "$blocked_file")"
+  if [ "$blocked_n" != "$n" ]; then
+    echo "Error: the current block is on worker $blocked_n, not worker $n." >&2
+    exit 1
+  fi
+
+  rm -f "$blocked_file"
+  echo "Worker $n skipped. Its branch was NOT merged and must be handled manually."
+}
+
+cmd_merge() {
+  local abort=false skip_n="" explicit_workers=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --abort)
+        abort=true
+        shift
+        ;;
+      --skip)
+        shift
+        skip_n="${1:-}"
+        if [ -z "$skip_n" ] || ! [[ "$skip_n" =~ ^[0-9]+$ ]]; then
+          echo "Usage: foreman.sh merge --skip <n>" >&2
+          exit 1
+        fi
+        shift
+        ;;
+      -*)
+        echo "Error: unknown 'merge' option '$1'" >&2
+        exit 1
+        ;;
+      *)
+        if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+          echo "Error: worker number must be numeric, got: '$1'" >&2
+          exit 1
+        fi
+        explicit_workers="$explicit_workers $1"
+        shift
+        ;;
+    esac
+  done
+
+  if [ "$abort" = true ] && [ -n "$skip_n" ]; then
+    echo "Usage: foreman.sh merge [--abort | --skip <n> | <n> ...]" >&2
+    exit 1
+  fi
+  if { [ "$abort" = true ] || [ -n "$skip_n" ]; } && [ -n "$explicit_workers" ]; then
+    echo "Usage: foreman.sh merge [--abort | --skip <n> | <n> ...]" >&2
+    exit 1
+  fi
+
+  PROJECT="$(pwd)"
+  local foreman_dir="$PROJECT/.foreman"
+  mkdir -p "$foreman_dir"
+
+  merge_validate_cwd
+
+  local lockdir="$foreman_dir/merge.lock"
+  merge_acquire_lock "$lockdir"
+
+  if [ "$abort" = true ]; then
+    merge_do_abort "$foreman_dir"
+    return 0
+  fi
+
+  if [ -n "$skip_n" ]; then
+    merge_do_skip "$foreman_dir" "$skip_n"
+    return 0
+  fi
+
+  merge_do_run "$foreman_dir" "$explicit_workers"
+}
+
 # --- dispatch -----------------------------------------------------------------
 
 main() {
@@ -569,6 +974,9 @@ main() {
       ;;
     clean)
       cmd_clean
+      ;;
+    merge)
+      cmd_merge "$@"
       ;;
     help|-h|--help)
       usage

@@ -45,22 +45,25 @@ If the Orchestrator and Dissenter cannot resolve a disagreement after one round,
 After plan approval, the Orchestrator spawns Workers via the `foreman.sh spawn worker <n>` command. Each Worker gets an isolated git worktree. The Architect, Dissenter, Inspector, Cleaner, Circuit Breaker, and Muse are pre-spawned at startup via `foreman.sh start`.
 
 ### 5. Workers Build
-Workers execute assigned tasks in their worktrees. They coordinate laterally with each other and can ping the Architect directly for plan clarification. The Orchestrator stays out of implementation decisions.
+Workers execute assigned tasks in their worktrees. They coordinate laterally with each other and can ping the Architect directly for plan clarification. The Orchestrator stays out of implementation decisions. Workers commit their work before reporting completion — uncommitted changes never merge.
 
 ### 6. Cleaner Runs Continuously
-The Cleaner keeps the job site tidy throughout the build. Its final deep sweep runs *after* the Inspector clears.
+The Cleaner keeps the job site tidy throughout the build, working in worker worktrees on request. Its final deep sweep runs *after* the Inspector clears, and only then in the main project directory.
 
-### 7. Architect Conformance Review
-When Workers complete, the Architect checks whether the implementation matches `CURRENT_PLAN.md`. It reads the actual changed files.
+### 7. Orchestrator Merges
+The Orchestrator runs `foreman.sh merge` to land every worker's branch onto a `foreman-integration` branch. A conflict blocks merging until the affected Worker merges `foreman-integration` into its own worktree, resolves, and reports back — every other worker stays gated in the meantime. All review from here on reads this integrated tree.
 
-### 8. Inspector Audit
+### 8. Architect Conformance Review
+Once merged, the Architect checks whether the implementation matches `CURRENT_PLAN.md`. It reads the actual changed files on `foreman-integration`.
+
+### 9. Inspector Audit
 The Inspector reads everything: the plan, all changed files, affected existing code. Audit covers correctness, security, and plan conformance. A BLOCK finding halts the commit until fixed. Nothing bypasses the Inspector without an explicit Orchestrator override recorded in `DECISIONS.md`.
 
-### 9. Cleaner Final Sweep
-After Inspector clearance, the Cleaner runs its final sweep: lint, dead code, imports, formatting.
+### 10. Cleaner Final Sweep
+After Inspector clearance, the Cleaner runs its final sweep on `foreman-integration`: lint, dead code, imports, formatting — and commits that sweep itself before reporting done.
 
-### 10. Orchestrator Reports
-The Orchestrator reports completion to you and signals readiness for PR. You run `/dev-go` when you are ready to open it. The crew does not open PRs automatically.
+### 11. Orchestrator Reports
+The Orchestrator reports completion to you and signals readiness for PR from `foreman-integration`. You run `/dev-go` when you are ready to open it. The crew does not open PRs automatically.
 
 ## Circuit Breaker Protocol
 
@@ -110,6 +113,7 @@ The `scripts/foreman.sh` CLI manages the crew's lifecycle. All crew members run 
 | `foreman.sh status` | Check liveness of each crew member (PID check) and print the last log line for each. |
 | `foreman.sh logs <role> [-f]` | Print or follow the log for a specific crew member (e.g., `logs architect`, `logs worker-1 -f`). |
 | `foreman.sh clean` | Remove all worker worktrees (refuses if any have uncommitted changes) and prune Relay state. |
+| `foreman.sh merge [--abort\|--skip <n>\|<n> ...]` | Merge worker branches into `foreman-integration`; `--abort` restores the pre-merge branch, `--skip <n>` clears a conflict block without merging that worker. |
 
 ### Session Naming Convention
 

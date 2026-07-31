@@ -21,6 +21,16 @@ for test in "$TESTS_DIR"/test_*.py; do
   fi
 done
 
+for test in "$TESTS_DIR"/test_*.sh; do
+  [ -e "$test" ] || continue
+  echo ""
+  echo "== $(basename "$test") =="
+  if ! bash "$test"; then
+    echo "FAILED: $(basename "$test")"
+    failures=$((failures + 1))
+  fi
+done
+
 echo ""
 if [ "$failures" -gt 0 ]; then
   echo "RESULT: $failures test file(s) failed"

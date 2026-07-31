@@ -55,19 +55,37 @@ Tell Workers: "For plan questions, ping `foreman-architect` directly."
 ### Step 5: Monitor
 Track Worker progress. Status check any Worker that goes silent. If a Worker reports a blocker that invalidates the plan, notify the Architect and get a plan revision before unblocking.
 
-### Step 6: TypeScript Review (if applicable)
-If completed work includes TypeScript files, invoke `/ts-review` before inspection. Apply any edits via the relevant Worker before proceeding.
+### Step 6: Merge Worker Branches
+Before any review runs, land the workers' worktrees onto `foreman-integration`. The conformance review, the TypeScript review, and the Inspector audit all read the main project directory — until this step runs, that directory does not contain the workers' output.
 
-### Step 7: Architect Conformance Review
-When all Workers report completion, notify the Architect:
+Run via your Bash tool:
 
 ```
-relay_ask("foreman-architect", "Workers complete. Please perform conformance review against CURRENT_PLAN.md.")
+foreman.sh merge
 ```
 
-Wait for the Architect's CONFORMANCE report. If FAIL, direct Workers to fix the gaps and re-request conformance.
+This merges every worker branch, in order, into `foreman-integration` (created off the branch you were on, which is recorded so it can be restored later).
 
-### Step 8: Inspector Audit
+**If a merge conflicts**, `foreman.sh merge` stops and reports the blocked worker, the conflicted files, and the `foreman-integration` SHA to converge against. Resolve it as a loop:
+1. Direct the blocked Worker to merge `foreman-integration` into its own worktree (the one sanctioned exception to "Workers never merge"), resolve against the reported SHA, commit, and report back.
+2. Rerun `foreman.sh merge <n>` for that worker.
+3. Every other worker stays gated — `foreman.sh merge` refuses any other worker number — until the block resolves or you explicitly run `foreman.sh merge --skip <n>` to drop it and handle that worker manually.
+
+If you need to abandon the integration attempt entirely, `foreman.sh merge --abort` restores the branch you started from; `foreman-integration` is left in place for inspection rather than deleted.
+
+### Step 7: TypeScript Review (if applicable)
+If the integrated work includes TypeScript files, invoke `/ts-review` (against `foreman-integration`) before inspection. Apply any edits via the relevant Worker's worktree, then rerun `foreman.sh merge` for that worker before proceeding.
+
+### Step 8: Architect Conformance Review
+When the merge is clean, notify the Architect:
+
+```
+relay_ask("foreman-architect", "Workers merged into foreman-integration. Please perform conformance review against CURRENT_PLAN.md.")
+```
+
+Wait for the Architect's CONFORMANCE report (it reviews `foreman-integration`, the integrated tree). If FAIL, direct Workers to fix the gaps in their worktrees, rerun `foreman.sh merge` for the affected workers, and re-request conformance.
+
+### Step 9: Inspector Audit
 Send an inspection request to the Inspector:
 
 ```
@@ -94,23 +112,26 @@ Decision: Override. Reason: [your reasoning].
 Reversal trigger: [what would make this wrong].
 ```
 
-### Step 9: Cleaner Sweep
-Notify the Cleaner to run its final sweep:
+### Step 10: Cleaner Sweep
+Notify the Cleaner to run its final sweep on `foreman-integration`:
 
 ```
-relay_ask("foreman-cleaner", "Inspection passed. Run final sweep.")
+relay_ask("foreman-cleaner", "Inspection passed. Run final sweep on foreman-integration.")
 ```
 
-### Step 10: Report to Owner
+The Cleaner commits its own sweep (e.g. `chore: cleaner final sweep`) before reporting back — its changes land on `foreman-integration` too.
+
+### Step 11: Report to Owner
 When the Cleaner completes, report to the owner:
 
 ```
 Job complete. Goal: [restate goal].
 Inspection: [PASS | PASS WITH NOTES — list notes if any].
+Branch: foreman-integration (started from [recorded pre-merge branch]).
 Ready for PR. Run /dev-go when you want to open it.
 ```
 
-Do not open the PR yourself. That is the owner's call.
+Name `foreman-integration` as the PR branch and mention the pre-merge branch it was recorded from (`.foreman/pre-merge-branch`), so the owner knows what to diff against. Do not open the PR yourself. That is the owner's call.
 
 ## What You Do Not Do
 

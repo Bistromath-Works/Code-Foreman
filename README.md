@@ -70,13 +70,14 @@ The workflow is, in principle, simple. In practice it is also simple, which is w
 1. **You give the Orchestrator a goal.** This is the only agent you talk to. Chain of command exists for a reason.
 2. **The Architect writes the plan.** It reads your codebase (read-only), then writes a concrete, phased `CURRENT_PLAN.md`. No plan comes from thin air.
 3. **The Dissenter reviews the plan.** Before a single line of code is written, the Dissenter stress-tests the reasoning — First Principles first, then approach. Not the code. The *reasoning*. This is an important distinction that most review processes get wrong.
-4. **Workers build.** Each Worker gets an isolated git worktree. They make their own implementation decisions without checking in on every variable name. They are, after all, competent.
-5. **The Cleaner cleans.** Continuously. Like the tide, but for dead code.
-6. **The Architect checks conformance.** When Workers complete, the Architect verifies the implementation matches `CURRENT_PLAN.md`.
-7. **The Inspector audits.** The Inspector reads everything — the plan, all changed files, affected existing code. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
-8. **The Cleaner does a final sweep.** After Inspector clearance: lint, dead code, imports, formatting.
-9. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
-10. **The Orchestrator approves.** You get your code.
+4. **Workers build.** Each Worker gets an isolated git worktree. They make their own implementation decisions without checking in on every variable name. They are, after all, competent. They commit before reporting done — uncommitted work does not merge.
+5. **The Cleaner cleans.** Continuously, in worker worktrees on request. Like the tide, but for dead code.
+6. **The Orchestrator merges.** `foreman.sh merge` lands every worker branch onto `foreman-integration`, sequentially, so the reviews that follow actually see the work. A conflict blocks that one worker until it merges `foreman-integration` back into its own worktree and resolves; everyone else waits.
+7. **The Architect checks conformance.** Once merged, the Architect verifies `foreman-integration` matches `CURRENT_PLAN.md`.
+8. **The Inspector audits.** The Inspector reads everything — the plan, all changed files, affected existing code — on `foreman-integration`. A BLOCK finding halts the commit. Nothing bypasses the Inspector without an explicit override recorded in `DECISIONS.md`.
+9. **The Cleaner does a final sweep.** After Inspector clearance, on `foreman-integration`: lint, dead code, imports, formatting — and commits that sweep itself.
+10. **The Dissenter reviews the results.** A second pass after the work is done, before anything is committed.
+11. **The Orchestrator approves.** You get your code, on `foreman-integration`, ready for a PR.
 
 The Circuit Breaker reads the traffic ledger and mechanically detects loops (sliding 15-minute window per agent pair). When a loop is confirmed, it flags both agents. If they continue looping, an arbiter model forces a binding decision. If the Orchestrator is one of the looping parties or the arbiter is unconfigured, it escalates to you instead, because even on a construction site, sometimes the foreman needs the owner to make a call.
 
@@ -94,6 +95,7 @@ foreman.sh status                   # Check liveness and last log line for each 
 foreman.sh logs <role> [-f]         # Print or follow logs for a role (e.g., logs architect, logs worker-1 -f)
 foreman.sh traffic [-f]             # Pretty-print (or follow) the traffic ledger—flight recorder for post-mortems
 foreman.sh clean                    # Remove worktrees (fails if uncommitted changes present) + prune
+foreman.sh merge [--abort|--skip <n>|<n>...]  # Land worker branches onto foreman-integration; --abort restores your pre-merge branch, --skip <n> drops a conflict block for manual handling
 ```
 
 Worker worktrees live under `.foreman/worktrees/worker-<n>/` within your project. `foreman.sh clean` removes them when you are done. Log files are in `.foreman/logs/`; `foreman.sh` keeps the whole `.foreman/` directory out of `git status` for you (via `.git/info/exclude`).
@@ -107,7 +109,7 @@ foreman/
 ├── SKILL.md                          # Main skill trigger and protocol
 ├── foreman.config.json               # Role → backend/model mapping (defaults)
 ├── scripts/
-│   ├── foreman.sh                    # Lifecycle CLI (start/spawn/stop/status/logs/clean)
+│   ├── foreman.sh                    # Lifecycle CLI (start/spawn/stop/status/logs/clean/merge)
 │   └── foreman-runner.py             # Generic runner (one process per crew member)
 └── references/
     ├── protocol.md                   # Shared communication norms (all agents)

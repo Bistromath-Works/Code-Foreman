@@ -246,7 +246,8 @@ foreman.sh merge --abort      # restore the pre-merge branch; foreman-integratio
 4. **Committed work only.** Before merging worker `<n>`, `merge` hard-errors
    if that worker's worktree has uncommitted changes — an unenforced "please
    commit" rule silently drops work. A branch with zero commits since its
-   fork point is merged but loudly flagged as a possible failed worker.
+   fork point is loudly flagged as a possible failed worker and skipped
+   (there is nothing to merge).
 5. **Sequential, with a conflict gate.** Branches merge in worker-number
    order. On conflict: `git merge --abort`, record the blocked worker and the
    integration SHA in `.foreman/merge-blocked`, and refuse to merge ANY other
