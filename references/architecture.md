@@ -216,6 +216,68 @@ foreground of the owner's terminal with the relay plugin channel flag and
 protocol + role context appended as system prompt, exactly as before. It is the
 only crew member with real relay MCP tools.
 
+## Integration: the merge workflow
+
+Workers build on isolated branches in isolated worktrees; `foreman.sh merge`
+is what lands their work. Without it, the conformance review and Inspector
+audit (which run in the main project directory) would inspect a tree the
+work never reached.
+
+### Commands
+
+```
+foreman.sh merge [<n> ...]    # merge worker branches (default: all) into foreman-integration
+foreman.sh merge --abort      # restore the pre-merge branch; foreman-integration is kept for inspection
+```
+
+### Rules (each exists because a specific failure mode was found in review)
+
+1. **Branch names survive worktree removal.** `spawn worker <n>` records the
+   worker's branch in `.foreman/worktrees/worker-<n>.branch`; `merge` reads
+   branch names from these state files (falling back to the live worktree),
+   and sanity-checks them against the `foreman-worker-<n>-*` naming pattern.
+2. **cwd validation.** `merge` refuses to run unless the current directory is
+   the main project root (`git rev-parse --show-toplevel` equals `pwd`, and
+   the path is not inside `.foreman/worktrees/`). It also refuses on a
+   detached HEAD and on a dirty main working tree.
+3. **First run:** records the current branch in `.foreman/pre-merge-branch`,
+   then creates and checks out `foreman-integration` off HEAD. Later runs
+   require `foreman-integration` to be the checked-out branch.
+4. **Committed work only.** Before merging worker `<n>`, `merge` hard-errors
+   if that worker's worktree has uncommitted changes — an unenforced "please
+   commit" rule silently drops work. A branch with zero commits since its
+   fork point is merged but loudly flagged as a possible failed worker.
+5. **Sequential, with a conflict gate.** Branches merge in worker-number
+   order. On conflict: `git merge --abort`, record the blocked worker and the
+   integration SHA in `.foreman/merge-blocked`, and refuse to merge ANY other
+   worker until the blocked one succeeds or is explicitly skipped
+   (`foreman.sh merge --skip <n>`). Recovery: the blocked Worker merges
+   `foreman-integration` into its own worktree (the one sanctioned exception
+   to "workers never merge"), resolves against the recorded SHA, commits,
+   and reports; then `merge <n>` is rerun.
+6. **Hook failures are not conflicts.** A merge that fails with no unmerged
+   files (`git ls-files -u` empty) is reported as a hook/tooling failure
+   with the underlying git output, not as a content conflict.
+7. **Locking.** `merge` holds `.foreman/merge.lock` (mkdir-based) for its
+   duration; concurrent invocations fail fast instead of corrupting the
+   index.
+8. **`merge --abort`** checks out the recorded pre-merge branch and leaves
+   `foreman-integration` in place for inspection (deleting it is printed as
+   a manual follow-up). This is the documented way out of an abandoned job.
+
+### Process changes
+
+- Workers MUST commit their work in their worktree before reporting
+  completion.
+- The Cleaner does not touch the main project directory during the build; it
+  works in worker worktrees on request. Its final sweep runs on
+  `foreman-integration` after the Inspector clears, and the Cleaner COMMITS
+  that sweep itself.
+- Orchestrator flow: Workers complete → `foreman.sh merge` (+ conflict loop)
+  → TypeScript review (on the integrated tree) → Architect conformance →
+  Inspector audit → Cleaner final sweep (committed) → report. The owner's PR
+  is opened from `foreman-integration`.
+
 ## Known Limitations
 
 - **Outbound ask wire format** is best-effort against Relay protocol v2 and has
