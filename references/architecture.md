@@ -28,7 +28,8 @@ Per-project runtime state lives in `<project>/.foreman/`:
 └── config.json                  # Optional per-project config override
 ```
 
-`.foreman/` should be added to the project's `.gitignore`.
+`foreman.sh` automatically appends `.foreman/` to the project's
+`.git/info/exclude` so runtime state never shows up in `git status`.
 
 ## Model Agnosticism
 

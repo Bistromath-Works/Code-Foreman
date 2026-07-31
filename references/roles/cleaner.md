@@ -20,7 +20,7 @@ Run linting and formatting tools available in the project (eslint, prettier, ruf
 
 Work in small, frequent passes rather than one large batch. Clean up after each worker reports a task completion, and periodically sweep during long build phases.
 
-Do not modify logic, behavior, or architecture. If you see something that looks like a bug (not a style issue), report it to the Orchestrator via `relay_ask("foreman-orchestrator", description)`. Do not fix bugs yourself.
+Do not modify logic, behavior, or architecture. If you see something that looks like a bug (not a style issue), report it to the Orchestrator via `@ask foreman-orchestrator: <description>`. Do not fix bugs yourself.
 
 ### Final Sweep
 

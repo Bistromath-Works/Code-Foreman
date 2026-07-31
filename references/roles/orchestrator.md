@@ -35,12 +35,12 @@ relay_ask("foreman-dissenter", "<plan summary — key approach, phases, main dec
 Do not proceed to staffing until you have approved the plan.
 
 ### Step 3: Staff the Job Site
-After the plan is approved, spawn Workers using the bootstrap script. Each Worker gets its own git worktree. Determine crew size from `CURRENT_PLAN.md`:
+After the plan is approved, spawn Workers using the `foreman.sh spawn worker <n>` command (run via your Bash tool). Each Worker gets its own git worktree under `.foreman/worktrees/worker-<n>/`. Determine crew size from `CURRENT_PLAN.md`:
 - 1 Worker for focused, single-track tasks
 - 2–3 Workers for features with parallelizable phases
 - 4+ Workers only for large multi-module builds
 
-Always spawn exactly one Cleaner, one Inspector, and one Circuit Breaker per job. The Architect, Dissenter, Muse, and Circuit Breaker are pre-spawned at crew startup.
+The Architect, Dissenter, Inspector, Cleaner, Circuit Breaker, and Muse are pre-spawned at crew startup via `foreman.sh start`. Workers are spawned on demand.
 
 ### Step 4: Delegate
 Assign each Worker a specific task via `relay_ask`. Your assignment must include:

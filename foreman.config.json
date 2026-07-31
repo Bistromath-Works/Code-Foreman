@@ -1,0 +1,18 @@
+{
+  "defaults": { "backend": "claude-cli", "model": "sonnet" },
+  "roles": {
+    "orchestrator":    { "backend": "claude-interactive", "model": "opus" },
+    "architect":       { "backend": "claude-cli", "model": "sonnet",
+                         "allowed_tools": ["Read", "Glob", "Grep", "Write", "Bash(git diff:*)", "Bash(git log:*)"] },
+    "dissenter":       { "backend": "claude-cli", "model": "sonnet",
+                         "allowed_tools": ["Read", "Glob", "Grep"] },
+    "inspector":       { "backend": "claude-cli", "model": "opus",
+                         "allowed_tools": ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)"] },
+    "worker":          { "backend": "claude-cli", "model": "sonnet" },
+    "cleaner":         { "backend": "claude-cli", "model": "haiku" },
+    "circuit-breaker": { "backend": "claude-cli", "model": "haiku",
+                         "allowed_tools": [] },
+    "muse":            { "backend": "claude-cli", "model": "haiku",
+                         "allowed_tools": [] }
+  }
+}
