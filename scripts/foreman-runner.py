@@ -70,6 +70,23 @@ ARBITER_SYSTEM_CONTEXT = (
 ASK_DIRECTIVE_RE = re.compile(r"^@ask\s+(\S+):\s*(.+)$", re.MULTILINE)
 PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8}")
 
+# Files that must never be shipped to an arbiter (which may be a third-party
+# model endpoint) in an evidence packet.
+SENSITIVE_NAME_PATTERNS = (
+    "credential", "secret", "token", "apikey", "api_key", "private_key",
+    "password", "id_rsa", "id_ed25519",
+)
+SENSITIVE_SUFFIXES = (".env", ".pem", ".key", ".p12", ".pfx", ".keystore")
+
+
+def is_sensitive_filename(path: Path) -> bool:
+    name = path.name.lower()
+    if name.startswith(".env"):  # .env, .env.local, .env.production, ...
+        return True
+    if any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES):
+        return True
+    return any(pattern in name for pattern in SENSITIVE_NAME_PATTERNS)
+
 
 def log(name: str, message: str) -> None:
     print(f"[{name}] {message}", flush=True)
@@ -1064,6 +1081,9 @@ class LoopDetector:
                 candidate = (project_root / token).resolve()
                 candidate.relative_to(project_root)  # raises if it escapes the project dir
             except (OSError, ValueError):
+                continue
+            if is_sensitive_filename(candidate):
+                log(self.name, f"excluding sensitive file from evidence packet: {candidate.name}")
                 continue
             if candidate.is_file():
                 found.append(candidate)
