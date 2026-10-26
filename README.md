@@ -1,5 +1,11 @@
 # Foreman
 
+> **This version is archived.** Foreman now lives at
+> **[Bistromath-Works/Foreman-Rig](https://github.com/Bistromath-Works/Foreman-Rig)**: an
+> [OpenRig](https://www.openrig.dev) setup that works with any model, with optional Langfuse
+> tracing. The Claude Relay version below is kept for reference only and is no longer maintained.
+
+
 ### Or: How to Get Eight Artificial Minds to Build Something Without Arguing About It Forever
 
 It is a well-established fact that a single AI coding agent, left to its own devices, will produce code that works. It will also produce code that is structured in a way that makes perfect sense to it and absolutely no sense to anyone who has to maintain it six months later, including, somewhat ironically, itself.
